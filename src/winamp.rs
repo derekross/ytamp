@@ -85,6 +85,8 @@ pub struct WinampState {
     marquee_moved: Option<Instant>,
     /// The visualiser's memory, fed from the host's spectrum frames.
     pub analyser: Analyser,
+    /// What the visualiser shows; a click on the display cycles it.
+    pub vis_mode: crate::vis::VisMode,
     /// The playlist window: its first visible row, the wheel's leftover,
     /// and the corner drag's leftover.
     pub playlist_scroll: usize,
@@ -116,6 +118,7 @@ impl Default for WinampState {
             marquee_offset: 0,
             marquee_moved: None,
             analyser: Analyser::default(),
+            vis_mode: crate::vis::VisMode::default(),
             playlist_scroll: 0,
             playlist_selection: HashSet::new(),
             playlist_wheel: 0.0,
