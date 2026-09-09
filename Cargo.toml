@@ -9,6 +9,21 @@ repository = "https://github.com/CentauriAgent/ytamp"
 keywords = ["youtube-music", "winamp", "egui", "music-player", "skins"]
 categories = ["multimedia::audio"]
 
+[features]
+default = []
+## Real audio-device output via rodio/cpal.
+##
+## Off by default because the Linux backend needs ALSA headers that are not
+## installed on every box (this build machine included). Without this feature
+## the player engine still runs the whole pipeline — decode, EQ, analyser,
+## position/seek — against a paced null sink, so UI development and tests need
+## no audio hardware at all.
+##
+## To enable on Debian/Ubuntu:
+##   sudo apt install libasound2-dev pkg-config
+##   cargo build --features audio-alsa
+audio-alsa = ["dep:rodio", "dep:cpal"]
+
 [dependencies]
 anyhow = "1"
 thiserror = "2"
@@ -34,17 +49,22 @@ tiny-skia = "0.11"
 # pixel text cannot use egui's own glyph runs (they are smoothed).
 skrifa = "0.44"
 
-# Audio output and decoding.
-rodio = { version = "0.21", default-features = false, features = ["playback"] }
-cpal = "0.16"
+# Audio decoding (symphonia: pure Rust, no system libs) and *optional* device
+# output (rodio + cpal: need ALSA headers on Linux — see the `audio-alsa`
+# feature above). The engine's null sink keeps the app fully functional for
+# development and CI without an audio device.
+rodio = { version = "0.21", default-features = false, features = ["playback"], optional = true }
+cpal = { version = "0.16", optional = true }
 symphonia = { version = "0.5", features = ["aac", "isomp4"] }
 
 # InnerTube client + streaming.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip", "http2", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json", "gzip", "http2", "stream", "cookies"] }
 futures-util = "0.3"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs", "process"] }
 
 rand = "0.9"
+# FFT for the spectrum analyser tap (Builder B).
+rustfft = "6"
 open = "5"
 urlencoding = "2"
 jiff = "0.2"
