@@ -529,6 +529,17 @@ fn grip(view: &mut View, state: &mut WinampState, height: u32) {
     let response = view
         .interact(corner, "playlist-grip", Sense::drag())
         .on_hover_cursor(egui::CursorIcon::ResizeVertical);
+    // The compositor gets the drag as a resize of the window's bottom
+    // edge, live, where it allows one; the host reads the height back.
+    // The steps below still count for compositors that ignore it.
+    if response.drag_started() {
+        view.ui
+            .ctx()
+            .send_viewport_cmd(egui::ViewportCommand::BeginResize(
+                egui::ResizeDirection::South,
+            ));
+        state.resize_grab = Some(std::time::Instant::now());
+    }
     if response.dragged() {
         state.playlist_resize += response.drag_delta().y / view.unit;
         let step = layout::PLAYLIST_RESIZE_STEP as f32;

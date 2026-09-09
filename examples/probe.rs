@@ -22,7 +22,12 @@ fn main() {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(16);
     let (evt_tx, mut evt_rx) = broadcast::channel(512);
-    let engine = PlayerEngine::spawn(cmd_rx, evt_tx).expect("engine");
+    // YTAMP_COOKIES=/path/to/cookies.txt runs the probe signed in.
+    let cookies =
+        std::env::var_os("YTAMP_COOKIES").and_then(|path| std::fs::read_to_string(path).ok());
+    let client = ytamp::yt::YtClient::new(cookies);
+    println!("signed in: {}", client.has_cookies());
+    let engine = PlayerEngine::spawn_with(cmd_rx, evt_tx, client).expect("engine");
     let track = Track {
         video_id: video_id.clone(),
         title: "probe".into(),

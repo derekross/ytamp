@@ -155,11 +155,13 @@ fn native_options(mini: Option<MiniWindow>, force_x11: bool) -> eframe::NativeOp
     let viewport = match mini {
         Some(mini) => {
             // See-through for skins that are not rectangles: the skin
-            // paints every pixel that is the window.
+            // paints every pixel that is the window. Resizable, within
+            // min/max hints the app keeps equal except for the playlist's
+            // range, so its grip can hand a resize to the compositor.
             let viewport = viewport
                 .with_decorations(false)
                 .with_transparent(true)
-                .with_resizable(false)
+                .with_resizable(true)
                 .with_maximize_button(false)
                 .with_inner_size(mini.size)
                 .with_min_inner_size(mini.size)

@@ -106,6 +106,9 @@ pub struct WinampState {
     pub playlist_resize: f32,
     /// The playlist's rows drawn as pixels, kept once drawn.
     pub playlist_text: crate::ui::winamp::PixelText,
+    /// When the playlist's grip handed a resize to the compositor: while
+    /// set, the host reads the playlist's height back from the window.
+    pub resize_grab: Option<Instant>,
 }
 
 impl Default for WinampState {
@@ -134,6 +137,7 @@ impl Default for WinampState {
             playlist_wheel: 0.0,
             playlist_resize: 0.0,
             playlist_text: crate::ui::winamp::PixelText::default(),
+            resize_grab: None,
         }
     }
 }
@@ -164,6 +168,54 @@ impl WinampState {
             };
         }
         height
+    }
+
+    /// The stack's height without the playlist, in skin pixels.
+    pub fn stack_base(&self) -> u32 {
+        let playlist = if self.playlist_open {
+            if self.playlist_shaded {
+                crate::skin::layout::PLAYLIST_SHADE_HEIGHT
+            } else {
+                self.playlist_height.clamp(
+                    crate::skin::layout::PLAYLIST_MIN_HEIGHT,
+                    crate::skin::layout::PLAYLIST_MAX_HEIGHT,
+                )
+            }
+        } else {
+            0
+        };
+        self.stack_height() - playlist
+    }
+
+    /// The stack heights the playlist grip may stretch between, when the
+    /// playlist is open and unrolled.
+    pub fn stack_range(&self) -> Option<(u32, u32)> {
+        use crate::skin::layout;
+        (self.playlist_open && !self.playlist_shaded).then(|| {
+            let base = self.stack_base();
+            (
+                base + layout::PLAYLIST_MIN_HEIGHT,
+                base + layout::PLAYLIST_MAX_HEIGHT,
+            )
+        })
+    }
+
+    /// Takes the playlist's height from a window height the compositor
+    /// chose, snapped to the grip's steps. Returns whether it changed.
+    pub fn adopt_stack_height(&mut self, stack: u32) -> bool {
+        use crate::skin::layout;
+        if !self.playlist_open || self.playlist_shaded {
+            return false;
+        }
+        let playlist = stack.saturating_sub(self.stack_base()) as f32;
+        let step = layout::PLAYLIST_RESIZE_STEP as f32;
+        let snapped = ((playlist - layout::PLAYLIST_MIN_HEIGHT as f32) / step).round() * step
+            + layout::PLAYLIST_MIN_HEIGHT as f32;
+        let height =
+            (snapped as u32).clamp(layout::PLAYLIST_MIN_HEIGHT, layout::PLAYLIST_MAX_HEIGHT);
+        let changed = height != self.playlist_height;
+        self.playlist_height = height;
+        changed
     }
 
     /// The characters the marquee shows now: the text itself when it

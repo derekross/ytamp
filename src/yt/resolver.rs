@@ -25,6 +25,7 @@ pub(crate) struct Candidate {
     mime: String,
     bitrate: i64,
     duration_secs: Option<u64>,
+    content_length: Option<u64>,
 }
 
 /// Itag preference order: 141 (Premium AAC 256k) → 140 (AAC 128k), then any
@@ -69,6 +70,10 @@ pub(crate) fn pick_audio_format(resp: &Value) -> Option<Candidate> {
                     .and_then(Value::as_str)
                     .and_then(|s| s.parse::<u64>().ok())
                     .map(|ms| ms / 1000),
+                content_length: f
+                    .get("contentLength")
+                    .and_then(Value::as_str)
+                    .and_then(|s| s.parse::<u64>().ok()),
             })
         })
         .collect();
@@ -156,6 +161,12 @@ pub async fn resolve_stream(client: &YtClient, video_id: &str) -> Result<StreamU
                     .and_then(Value::as_str)
                     .unwrap_or("UNKNOWN");
                 match pick_audio_format(&resp) {
+                    Some(candidate) if !serves_whole_file(client, &candidate).await => {
+                        attempts.push(format!(
+                            "{}: itag {} url is cut off (PO token wanted)",
+                            ctx.key, candidate.itag
+                        ));
+                    }
                     Some(candidate) => {
                         log::info!(
                             "resolved {} via {} (itag {}, {})",
@@ -188,7 +199,7 @@ pub async fn resolve_stream(client: &YtClient, video_id: &str) -> Result<StreamU
         "no client resolved {video_id} natively ({}); trying yt-dlp",
         attempts.join("; ")
     );
-    match yt_dlp_fallback(video_id).await {
+    match yt_dlp_fallback(video_id, client.cookie_file()).await {
         Ok(stream) => Ok(stream),
         Err(e) => Err(anyhow!(
             "no stream for {video_id} ({}). {e:#}",
@@ -197,19 +208,58 @@ pub async fn resolve_stream(client: &YtClient, video_id: &str) -> Result<StreamU
     }
 }
 
+/// Whether a resolved URL serves its last bytes. googlevideo answers the
+/// first megabyte or so of a stream that lacks a required PO token and
+/// 403s after it, which would only surface mid-probe; one small ranged
+/// request near the end tells in advance. Unknown lengths pass.
+async fn serves_whole_file(client: &YtClient, candidate: &Candidate) -> bool {
+    let Some(len) = candidate.content_length.filter(|len| *len > 4096) else {
+        return true;
+    };
+    let range = format!("bytes={}-{}", len - 2048, len - 1);
+    match client
+        .http()
+        .get(&candidate.url)
+        .header(reqwest::header::RANGE, range)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            if !ok {
+                log::debug!("itag {} tail check: HTTP {}", candidate.itag, resp.status());
+            }
+            ok
+        }
+        Err(e) => {
+            log::debug!("itag {} tail check failed: {e}", candidate.itag);
+            true // a network hiccup is not proof; let the decoder try
+        }
+    }
+}
+
 /// `yt-dlp -J` fallback (youtui's proven pattern). Requires the `yt-dlp`
 /// binary on PATH; produces a clean error when missing.
-async fn yt_dlp_fallback(video_id: &str) -> Result<StreamUrl> {
+async fn yt_dlp_fallback(
+    video_id: &str,
+    cookie_file: Option<std::path::PathBuf>,
+) -> Result<StreamUrl> {
     let watch_url = format!("https://www.youtube.com/watch?v={video_id}");
+    let mut command = tokio::process::Command::new("yt-dlp");
+    command
+        .arg("-J")
+        .arg("-f")
+        .arg("141/140/bestaudio[ext=m4a]/bestaudio")
+        .arg("--no-playlist");
+    // Signed in: yt-dlp gets the same account, and with it the Premium
+    // formats it can unscramble and this resolver cannot (yet).
+    if let Some(jar) = cookie_file.filter(|jar| jar.is_file()) {
+        command.arg("--cookies").arg(jar);
+    }
     let output = tokio::time::timeout(
         Duration::from_secs(90),
-        tokio::process::Command::new("yt-dlp")
-            .arg("-J")
-            .arg("-f")
-            .arg("141/140/bestaudio[ext=m4a]/bestaudio")
-            .arg("--no-playlist")
-            .arg(&watch_url)
-            .output(),
+        command.arg(&watch_url).output(),
     )
     .await
     .map_err(|_| anyhow!("yt-dlp timed out after 90s"))?

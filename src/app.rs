@@ -155,15 +155,20 @@ fn safe_file_name(name: &str) -> String {
 }
 
 /// How long a compositor gets to honour a resize before the mini window
-/// is reopened at the wanted size instead.
-const RESIZE_PATIENCE: f64 = 1.5;
+/// is reopened at the wanted size instead. winit refuses client resizes
+/// on Wayland whenever the compositor reports the window tiled (COSMIC
+/// does, even floating), so this is the usual path there.
+const RESIZE_PATIENCE: f64 = 0.3;
+/// A compositor-driven resize (the playlist grip) is over once the window
+/// has held still this long.
+const GRAB_SETTLE: Duration = Duration::from_millis(400);
 
 /// Fits the fixed-size mini window to its wanted size. Compositors refuse
 /// chatty resize requests, so a rejected ask retries at most once a
 /// second (fastpotify's pattern). Returns true when the window has been
 /// the wrong size for longer than [`RESIZE_PATIENCE`]: a tiling or
 /// otherwise stubborn compositor, and the caller should reopen instead.
-fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) -> bool {
+fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2, heights: (f32, f32)) -> bool {
     // The screen rect, not the viewport's `inner_rect`: Wayland never
     // reports a window position, so `inner_rect` is `None` there and the
     // window would pass for fitted while the equalizer painted off its
@@ -189,8 +194,14 @@ fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) -> bool {
         return false;
     }
     ctx.data_mut(|data| data.insert_temp(asked, (now, wanted)));
-    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(wanted));
-    ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(wanted));
+    // Width fixed; the height may span the playlist's range, so an
+    // interactive resize from the grip has room to move.
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+        wanted.x, heights.0,
+    )));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+        wanted.x, heights.1,
+    )));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
     false
 }
@@ -489,6 +500,9 @@ impl YtampApp {
         // One client, shared with the engine: signing in later reaches
         // both, because `YtClient` clones share their credentials.
         let yt = Arc::new(YtClient::new(cookies));
+        if yt.has_cookies() {
+            yt.set_cookie_file(settings.cookie_path.as_deref().map(PathBuf::from));
+        }
         match PlayerEngine::spawn_with(cmd_rx, event_tx.clone(), (*yt).clone()) {
             Ok(engine) => {
                 engine_handle = Some(engine);
@@ -809,6 +823,8 @@ impl YtampApp {
             .filter(|text| !text.trim().is_empty());
         let present = cookies.is_some();
         let signed_in = self.yt.set_cookies(cookies);
+        self.yt
+            .set_cookie_file(path.as_deref().filter(|_| signed_in).map(PathBuf::from));
         let message = match (&path, present, signed_in) {
             (Some(_), true, true) => "Signed in: account cookies applied".to_string(),
             (Some(p), true, false) => {
@@ -1188,8 +1204,37 @@ impl YtampApp {
         // The app owns which side windows are open; the skinned state is
         // kept in step before the draw.
         self.mini.winamp.eq_open = self.eq_open;
+        let unit = self.mini.winamp.scale as f32;
+        let heights = match self.mini.winamp.stack_range() {
+            Some((low, high)) => (low as f32 * unit, high as f32 * unit),
+            None => {
+                let h = self.mini.winamp.stack_height() as f32 * unit;
+                (h, h)
+            }
+        };
+        // While the grip's resize is with the compositor, the window's
+        // height is the truth: read the playlist's height back from it.
+        if let Some(grabbed) = self.mini.winamp.resize_grab {
+            let stack = (ctx.viewport_rect().height() / unit).round() as u32;
+            let moved = self.mini.winamp.adopt_stack_height(stack);
+            let settle = egui::Id::new("ytamp-grab-settle");
+            let last_move: Instant = if moved {
+                ctx.data_mut(|data| data.insert_temp(settle, Instant::now()));
+                Instant::now()
+            } else {
+                ctx.data(|data| data.get_temp(settle)).unwrap_or(grabbed)
+            };
+            let pointer_up = ctx.input(|input| !input.pointer.any_down());
+            if (pointer_up && last_move.elapsed() > GRAB_SETTLE)
+                || grabbed.elapsed() > Duration::from_secs(20)
+            {
+                self.mini.winamp.resize_grab = None;
+                ctx.data_mut(|data| data.remove::<Instant>(settle));
+            }
+            ctx.request_repaint_after(Duration::from_millis(50));
+        }
         let wanted = crate::ui::winamp::window_size(&self.mini.winamp);
-        if fit_mini_window(&ctx, wanted) {
+        if self.mini.winamp.resize_grab.is_none() && fit_mini_window(&ctx, wanted, heights) {
             // Reopen at the right size: the shell's loop makes a new mini
             // window when the intent is set while the mode stays mini.
             self.mini.pos.remember();

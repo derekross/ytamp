@@ -38,6 +38,9 @@ pub(crate) struct ClientCtx {
     pub music: bool,
     /// This client is only tried when cookies are present.
     pub needs_cookies: bool,
+    /// Account cookies and the signing header go to this client (yt-dlp's
+    /// `SUPPORTS_COOKIES`); the mobile clients answer HTTP 400 to them.
+    pub supports_cookies: bool,
 }
 
 /// The plain web client: only used to mint a visitor id.
@@ -51,6 +54,7 @@ const WEB: ClientCtx = ClientCtx {
     device_json: "",
     music: false,
     needs_cookies: false,
+    supports_cookies: true,
 };
 
 /// YT Music web client. Fresh search/next metadata; with cookies also the
@@ -65,6 +69,7 @@ const WEB_MUSIC: ClientCtx = ClientCtx {
     device_json: "",
     music: true,
     needs_cookies: true,
+    supports_cookies: true,
 };
 
 /// Anonymous player client with no PO-token policy in yt-dlp 2026.08.19:
@@ -80,6 +85,7 @@ const VISIONOS: ClientCtx = ClientCtx {
     device_json: r#"{"deviceMake":"Apple","deviceModel":"RealityDevice17,1","osName":"visionOS","osVersion":"26.5.23O471"}"#,
     music: false,
     needs_cookies: false,
+    supports_cookies: false,
 };
 
 /// Anonymous player client. yt-dlp 2026.08.19 marks its streams as
@@ -95,6 +101,7 @@ const ANDROID_VR: ClientCtx = ClientCtx {
     device_json: r#"{"deviceMake":"Oculus","deviceModel":"Quest 3","androidSdkVersion":32,"osName":"Android","osVersion":"12L"}"#,
     music: false,
     needs_cookies: false,
+    supports_cookies: false,
 };
 
 /// Anonymous player client; observed working from datacenter IPs when
@@ -109,6 +116,7 @@ const IOS: ClientCtx = ClientCtx {
     device_json: r#"{"deviceMake":"Apple","deviceModel":"iPhone16,2","osName":"iPhone","osVersion":"18.3.2.22D82"}"#,
     music: false,
     needs_cookies: false,
+    supports_cookies: false,
 };
 
 /// Last anonymous player client in the chain.
@@ -122,6 +130,7 @@ const TV: ClientCtx = ClientCtx {
     device_json: "",
     music: false,
     needs_cookies: false,
+    supports_cookies: true,
 };
 
 /// Player-request clients in chain order (DESIGN.md): cookies unlock
@@ -230,6 +239,9 @@ pub struct YtClient {
     /// Small TTL cache of resolved stream URLs (see resolver).
     pub(crate) stream_cache:
         Arc<Mutex<std::collections::HashMap<String, (StreamUrl, std::time::Instant)>>>,
+    /// The cookie jar on disk, handed to the yt-dlp fallback so a current
+    /// yt-dlp can serve the account's (Premium) formats.
+    cookie_file: Arc<std::sync::RwLock<Option<std::path::PathBuf>>>,
     /// The session's visitor id (`visitorData`), fetched once and kept for
     /// [`VISITOR_TTL`]. Player requests without it are answered with the
     /// "confirm you're not a bot" wall on ordinary home connections too.
@@ -254,6 +266,7 @@ impl YtClient {
         let client = Self {
             http: Self::build_http(),
             auth: Arc::new(std::sync::RwLock::new(None)),
+            cookie_file: Arc::new(std::sync::RwLock::new(None)),
             stream_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
             visitor: Arc::new(Mutex::new(None)),
         };
@@ -289,6 +302,18 @@ impl YtClient {
             cache.clear();
         }
         signed_in
+    }
+
+    /// Where the jar lives on disk, for the yt-dlp fallback; `None` when
+    /// signed out or the cookies came from memory.
+    pub fn set_cookie_file(&self, path: Option<std::path::PathBuf>) {
+        if let Ok(mut slot) = self.cookie_file.write() {
+            *slot = path;
+        }
+    }
+
+    pub(crate) fn cookie_file(&self) -> Option<std::path::PathBuf> {
+        self.cookie_file.read().ok().and_then(|slot| slot.clone())
     }
 
     fn auth(&self) -> Option<Auth> {
@@ -376,7 +401,7 @@ impl YtClient {
         if ctx.music {
             req = req.header("Referer", "https://music.youtube.com/");
         }
-        if let Some(auth) = self.auth() {
+        if let Some(auth) = self.auth().filter(|_| ctx.supports_cookies) {
             let origin = format!("https://{}", ctx.host);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

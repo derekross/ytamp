@@ -27,6 +27,8 @@ const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/201001
 const SIGNED_IN_COOKIE: &str = "SAPISID";
 
 enum Notice {
+    /// The page started for a URL (the window hides itself for YouTube).
+    Heading(String),
     Loaded(String),
 }
 
@@ -35,18 +37,31 @@ enum Notice {
 /// loop exits the process with the outcome as its status.
 pub fn run(cookie_path: PathBuf) -> Result<()> {
     let event_loop = EventLoopBuilder::<Notice>::with_user_event().build();
-    let window = WindowBuilder::new()
-        .with_title("Sign in to YouTube Music — ytamp")
-        .with_inner_size(tao::dpi::LogicalSize::new(560.0, 760.0))
-        .build(&event_loop)
-        .context("opening the sign-in window")?;
+    let window = std::rc::Rc::new(
+        WindowBuilder::new()
+            .with_title("Sign in to YouTube Music — ytamp")
+            .with_inner_size(tao::dpi::LogicalSize::new(560.0, 760.0))
+            .build(&event_loop)
+            .context("opening the sign-in window")?,
+    );
     let proxy = event_loop.create_proxy();
+    let load_proxy = proxy.clone();
+    let hidden = std::rc::Rc::clone(&window);
     let builder = WebViewBuilder::new()
         .with_url(LOGIN_URL)
         .with_user_agent(USER_AGENT)
+        .with_navigation_handler(move |url| {
+            // Signed in: the page heads for YouTube Music. Nobody needs
+            // to see it; the cookies are read and the window is gone.
+            if on_youtube(&url) {
+                hidden.set_visible(false);
+                let _ = proxy.send_event(Notice::Heading(url));
+            }
+            true
+        })
         .with_on_page_load_handler(move |event, url| {
             if matches!(event, PageLoadEvent::Finished) {
-                let _ = proxy.send_event(Notice::Loaded(url));
+                let _ = load_proxy.send_event(Notice::Loaded(url));
             }
         });
     #[cfg(target_os = "linux")]
@@ -71,7 +86,7 @@ pub fn run(cookie_path: PathBuf) -> Result<()> {
                 event: WindowEvent::CloseRequested,
                 ..
             } => std::process::exit(1),
-            Event::UserEvent(Notice::Loaded(url)) if on_youtube(&url) => {
+            Event::UserEvent(Notice::Heading(url) | Notice::Loaded(url)) if on_youtube(&url) => {
                 match webview.cookies() {
                     Ok(cookies) if signed_in(&cookies) => {
                         match std::fs::write(&cookie_path, netscape_jar(&cookies)) {
@@ -85,7 +100,9 @@ pub fn run(cookie_path: PathBuf) -> Result<()> {
                             }
                         }
                     }
-                    Ok(_) => {} // on YouTube, but not signed in yet
+                    // On YouTube without an account (the page was left
+                    // early): show it again so the user can carry on.
+                    Ok(_) => window.set_visible(true),
                     Err(error) => eprintln!("ytamp: reading cookies: {error}"),
                 }
             }
