@@ -98,6 +98,9 @@ pub struct Skin {
     /// Distinct per loaded skin, for change detection.
     pub id: u64,
     sheets: HashMap<Sheet, Bitmap>,
+    /// Whether the skin itself brought `nums_ex`: the built-in skin's
+    /// stand-in sheet does not count, as it is generated, not read.
+    extended_digits: bool,
     pub playlist: PlaylistStyle,
     pub vis_colors: VisColors,
     /// The windows' shapes, for skins that are not rectangles.
@@ -201,10 +204,12 @@ impl Skin {
         let regions = text("region.txt")
             .map(|text| config::parse_regions(&text))
             .unwrap_or_default();
+        let extended_digits = sheets.contains_key(&Sheet::NumsEx);
         Ok(Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             name,
             sheets,
+            extended_digits,
             playlist,
             vis_colors,
             regions,
@@ -225,8 +230,10 @@ impl Skin {
 
     /// Whether the time display can take its blank cell and minus sign
     /// from the skin's own digits, rather than borrowing a bar of the 2.
+    /// A skin that brought no `nums_ex` of its own — the built-in one
+    /// generated its stand-in — does without.
     pub fn has_extended_digits(&self) -> bool {
-        self.has(Sheet::NumsEx)
+        self.extended_digits
     }
 
     /// The bitmap for a sheet: the skin's own, or what stands in for a
@@ -291,7 +298,11 @@ fn builtin_bitmap(sheet: Sheet) -> Bitmap {
     ];
     let mut width = 0;
     let mut height = 0;
-    for sprite in sprites::ALL.iter().map(|(_, sprite)| *sprite).chain(indexed) {
+    for sprite in sprites::ALL
+        .iter()
+        .map(|(_, sprite)| *sprite)
+        .chain(indexed)
+    {
         if sprite.sheet == sheet {
             width = width.max(sprite.x + sprite.width);
             height = height.max(sprite.y + sprite.height);
@@ -301,7 +312,7 @@ fn builtin_bitmap(sheet: Sheet) -> Bitmap {
     Bitmap {
         width,
         height,
-        rgba: vec![r, g, b, 255; 4 * (width * height) as usize],
+        rgba: (0..width * height).flat_map(|_| [r, g, b, 255]).collect(),
     }
 }
 
@@ -315,6 +326,7 @@ static BUILTIN: LazyLock<Arc<Skin>> = LazyLock::new(|| {
         name: "ytamp".to_string(),
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
         sheets,
+        extended_digits: false,
         playlist: PlaylistStyle::default(),
         vis_colors: config::DEFAULT_VIS_COLORS,
         regions: Regions::default(),
@@ -341,7 +353,9 @@ mod tests {
     }
 
     fn testdata(name: &str) -> std::path::PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name)
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
     }
 
     #[test]
@@ -380,7 +394,11 @@ mod tests {
         let skin = Skin::from_archive("sparse", &archive).unwrap();
         for sheet in Sheet::ALL {
             let bitmap = skin.sheet(sheet);
-            assert!(bitmap.width > 0 && bitmap.height > 0, "{} is empty", sheet.file_stem());
+            assert!(
+                bitmap.width > 0 && bitmap.height > 0,
+                "{} is empty",
+                sheet.file_stem()
+            );
         }
         for (_, sprite) in sprites::ALL {
             assert!(skin.sprite(*sprite).is_some());
@@ -597,6 +615,7 @@ mod tests {
             for (name, sprite) in sprites::ALL {
                 let clipped = skin
                     .sprite(*sprite)
+                    .map(|(_, clipped)| clipped)
                     .unwrap_or_else(|| panic!("{name} is off its sheet"));
                 assert_eq!(clipped, *sprite, "{name} is cut off");
             }
@@ -621,7 +640,10 @@ mod tests {
         for name in ["base-2.91.wsz", "TopazAmp1-2.wsz", "XMMS-Turquoise.wsz"] {
             let skin = Skin::load(&testdata(name)).unwrap();
             let text = skin.sheet(Sheet::Text);
-            assert!(text.width >= 155 && text.height >= 18, "{name}'s text.bmp is undersized");
+            assert!(
+                text.width >= 155 && text.height >= 18,
+                "{name}'s text.bmp is undersized"
+            );
             let a = text.crop(font::glyph('A')).unwrap();
             let blank = text.crop(font::glyph(' ')).unwrap();
             assert_ne!(a, blank, "{name}'s font has no A");

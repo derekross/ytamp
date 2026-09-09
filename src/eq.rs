@@ -163,10 +163,7 @@ fn filters_for(sample_rate: u32, gains: &[f64; 10], widths: &[f64; 10]) -> Vec<(
         .enumerate()
         .filter(|(_, (_, gain))| gain.abs() > FLAT)
         .map(|(index, ((hz, width), gain))| {
-            (
-                index,
-                Biquad::peaking(sample_rate, *hz, *width, *gain),
-            )
+            (index, Biquad::peaking(sample_rate, *hz, *width, *gain))
         })
         .collect()
 }
@@ -500,7 +497,10 @@ mod tests {
     }
 
     fn rms(samples: &[f32]) -> f64 {
-        (samples.iter().map(|s| f64::from(*s) * f64::from(*s)).sum::<f64>()
+        (samples
+            .iter()
+            .map(|s| f64::from(*s) * f64::from(*s))
+            .sum::<f64>()
             / samples.len() as f64)
             .sqrt()
     }

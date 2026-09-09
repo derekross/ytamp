@@ -324,10 +324,7 @@ mod tests {
         );
         assert_eq!(style.normal, [0x00, 0xff, 0x00]);
         assert_eq!(style.current, [0xff, 0xff, 0xff]);
-        assert!(
-            style.normal_background,
-            PlaylistStyle::default().normal_background
-        );
+        assert!(style.normal_background == PlaylistStyle::default().normal_background);
     }
 
     #[test]

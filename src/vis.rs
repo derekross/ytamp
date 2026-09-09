@@ -132,8 +132,9 @@ impl Analyser {
 /// Maps the analyser's bands onto the nineteen bars. Winamp summed its own
 /// semitone-spaced columns four at a time; the input here is already
 /// log-spaced, so the bars read it evenly: one band per bar when the counts
-/// match, and a straight interpolation between the two nearest bands when
-/// they do not.
+/// match, a straight interpolation between the two nearest bands when there
+/// are more of them, and the missing high bands read as silence when there
+/// are fewer — a short frame is not stretched across the display.
 fn map_bands(bands: &[f32]) -> [f32; BARS] {
     let mut out = [0.0; BARS];
     let bands: Vec<f32> = bands.iter().map(|b| b.clamp(0.0, 1.0)).collect();
@@ -141,6 +142,12 @@ fn map_bands(bands: &[f32]) -> [f32; BARS] {
         0 => out,
         1 => {
             out.fill(bands[0]);
+            out
+        }
+        count if count < BARS => {
+            for (slot, band) in out.iter_mut().zip(bands) {
+                *slot = band;
+            }
             out
         }
         count => {
@@ -174,11 +181,12 @@ mod tests {
     fn the_bands_map_onto_the_bars() {
         // The count the analyser ships: one band per bar.
         let identity: Vec<f32> = (0..BARS).map(|i| i as f32 / BARS as f32).collect();
-        assert_eq!(map_bands(&identity), identity[..].try_into().unwrap());
-        // Twenty bands interpolate: the first and last bars keep their ends.
-        let mut twenty = vec![0.0f32; 20];
-        twenty[19] = 1.0;
-        let bars = map_bands(&twenty);
+        let expected: [f32; BARS] = identity[..].try_into().unwrap();
+        assert_eq!(map_bands(&identity), expected);
+        // Twenty bands interpolate along a ramp: the first and last bars
+        // keep their ends.
+        let ramp: Vec<f32> = (0..20).map(|i| i as f32 / 19.0).collect();
+        let bars = map_bands(&ramp);
         assert_eq!(bars[0], 0.0);
         assert!((bars[BARS - 1] - 1.0).abs() < 1e-6);
         // The bar just past the middle sits just past the middle band.
@@ -264,6 +272,10 @@ mod tests {
         analyser.reset();
         assert!(analyser.settled());
         let empty = analyser.step(&[], tick());
-        assert!(empty.iter().all(|bar| bar.height == 0 && bar.peak.is_none()));
+        assert!(
+            empty
+                .iter()
+                .all(|bar| bar.height == 0 && bar.peak.is_none())
+        );
     }
 }
