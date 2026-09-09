@@ -158,6 +158,28 @@ fn parse_search_item(item: &Value) -> Option<Track> {
         }
     }
 
+    // Playlist rows (the library, liked songs) keep the album in a third
+    // column and the duration in a fixed column at the right.
+    if album.is_none()
+        && let Some(third) = columns.get(2)
+    {
+        let text = runs_text(third.get("text").unwrap_or(&Value::Null));
+        if !text.is_empty() && parse_duration(&text).is_none() {
+            album = Some(text);
+        }
+    }
+    if duration_secs.is_none() {
+        let mut fixed: Vec<&Value> = Vec::new();
+        find_all(
+            item,
+            "musicResponsiveListItemFixedColumnRenderer",
+            &mut fixed,
+        );
+        duration_secs = fixed.iter().find_map(|column| {
+            parse_duration(&runs_text(column.get("text").unwrap_or(&Value::Null)))
+        });
+    }
+
     let thumb_url = best_thumb(item.get("thumbnail").unwrap_or(&Value::Null));
 
     Some(Track {
@@ -289,6 +311,26 @@ mod tests {
         assert_eq!(tracks[0].title, "Harder, Better, Faster, Stronger");
         assert_eq!(tracks[0].duration_secs, Some(227));
         assert!(tracks[1].artist.contains("Daft Punk") || !tracks[1].artist.is_empty());
+    }
+
+    #[test]
+    fn playlist_rows_take_album_and_duration_from_their_own_columns() {
+        let resp = serde_json::json!({ "contents": [ { "musicResponsiveListItemRenderer": {
+            "playlistItemData": { "videoId": "abcdefghijk" },
+            "flexColumns": [
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Rosewood" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Bonobo" } ] } } },
+                { "musicResponsiveListItemFlexColumnRenderer": { "text": { "runs": [ { "text": "Fragments" } ] } } }
+            ],
+            "fixedColumns": [
+                { "musicResponsiveListItemFixedColumnRenderer": { "text": { "runs": [ { "text": "5:17" } ] } } }
+            ]
+        } } ] });
+        let tracks = parse_search_tracks(&resp, 10);
+        assert_eq!(tracks.len(), 1);
+        assert_eq!(tracks[0].artist, "Bonobo");
+        assert_eq!(tracks[0].album.as_deref(), Some("Fragments"));
+        assert_eq!(tracks[0].duration_secs, Some(317));
     }
 
     #[test]

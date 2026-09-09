@@ -116,6 +116,14 @@ fn topbar(app: &mut YtampApp, ui: &mut egui::Ui) {
         }
         ui.separator();
         ui.selectable_value(&mut app.view, crate::app::View::Search, "Search");
+        if app.yt.has_cookies()
+            && ui
+                .button("♥ Liked")
+                .on_hover_text("Your liked songs")
+                .clicked()
+        {
+            app.begin_liked();
+        }
         ui.selectable_value(&mut app.view, crate::app::View::Settings, "Settings");
         ui.toggle_value(&mut app.show_queue, "Queue");
         if ui

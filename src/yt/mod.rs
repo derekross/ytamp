@@ -9,6 +9,15 @@ mod resolver;
 mod search;
 
 pub use innertube::YtClient;
+
+/// The YouTube `name=value` pairs a cookie jar would send, for tests of
+/// jar writers elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn innertube_cookies_for_test(jar: &str) -> Vec<String> {
+    innertube::cookie_header(&innertube::parse_netscape_cookies(jar, 0))
+        .map(|header| header.split("; ").map(str::to_string).collect())
+        .unwrap_or_default()
+}
 pub use resolver::{StreamUrl, resolve_stream};
 
 #[cfg(test)]

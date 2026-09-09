@@ -205,10 +205,28 @@ fn is_youtube_domain(domain: &str) -> bool {
 /// `YtClient::new(cookies)` takes the *contents* of a Netscape-format
 /// `cookies.txt` (Builder C reads the file; we own the parsing). Anonymous by
 /// default.
+/// Account credentials: the cookie header and the `SAPISID` that signs
+/// each request (yt-dlp's `_generate_cookie_auth_headers`).
+#[derive(Clone, Debug)]
+struct Auth {
+    cookie_header: String,
+    sapisid: String,
+}
+
+/// `Authorization: SAPISIDHASH <time>_<sha1("<time> <sapisid> <origin>")>`,
+/// the way YouTube's web clients sign requests with account cookies.
+pub(crate) fn sapisidhash(now_secs: u64, sapisid: &str, origin: &str) -> String {
+    use sha1::Digest as _;
+    let digest = sha1::Sha1::digest(format!("{now_secs} {sapisid} {origin}").as_bytes());
+    format!("SAPISIDHASH {now_secs}_{}", hex::encode(digest))
+}
+
 #[derive(Clone)]
 pub struct YtClient {
     http: reqwest::Client,
-    cookie_header: Option<String>,
+    /// Shared between clones, so the player engine's copy signs in and
+    /// out with the app's.
+    auth: Arc<std::sync::RwLock<Option<Auth>>>,
     /// Small TTL cache of resolved stream URLs (see resolver).
     pub(crate) stream_cache:
         Arc<Mutex<std::collections::HashMap<String, (StreamUrl, std::time::Instant)>>>,
@@ -224,7 +242,7 @@ const VISITOR_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60)
 impl std::fmt::Debug for YtClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("YtClient")
-            .field("cookies", &self.cookie_header.is_some())
+            .field("cookies", &self.has_cookies())
             .finish()
     }
 }
@@ -233,40 +251,66 @@ impl YtClient {
     /// Anonymous client. `cookies` is the raw text of a Netscape cookie.txt
     /// export; `None` means anonymous.
     pub fn new(cookies: Option<String>) -> Self {
+        let client = Self {
+            http: Self::build_http(),
+            auth: Arc::new(std::sync::RwLock::new(None)),
+            stream_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            visitor: Arc::new(Mutex::new(None)),
+        };
+        client.set_cookies(cookies);
+        client
+    }
+
+    /// Signs in with the text of a Netscape `cookies.txt`, or out with
+    /// `None`. Every clone of this client (the player engine's included)
+    /// follows. Returns whether usable YouTube account cookies were found.
+    pub fn set_cookies(&self, cookies: Option<String>) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        let header = cookies.as_deref().and_then(|text| {
+        let auth = cookies.as_deref().and_then(|text| {
             let parsed = parse_netscape_cookies(text, now);
-            cookie_header(&parsed)
+            let sapisid = parsed
+                .iter()
+                .find(|c| c.name == "SAPISID" || c.name == "__Secure-3PAPISID")
+                .map(|c| c.value.clone())?;
+            Some(Auth {
+                cookie_header: cookie_header(&parsed)?,
+                sapisid,
+            })
         });
-        Self {
-            http: Self::build_http(header.is_some()),
-            cookie_header: header,
-            stream_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            visitor: Arc::new(Mutex::new(None)),
+        let signed_in = auth.is_some();
+        if let Ok(mut slot) = self.auth.write() {
+            *slot = auth;
         }
+        // Streams resolved anonymously (or as someone else) are stale.
+        if let Ok(mut cache) = self.stream_cache.lock() {
+            cache.clear();
+        }
+        signed_in
     }
 
-    /// True when YouTube cookies were supplied and applied.
+    fn auth(&self) -> Option<Auth> {
+        self.auth.read().ok().and_then(|slot| slot.clone())
+    }
+
+    /// True when YouTube account cookies are applied.
     pub fn has_cookies(&self) -> bool {
-        self.cookie_header.is_some()
+        self.auth.read().is_ok_and(|slot| slot.is_some())
     }
 
     pub(crate) fn http(&self) -> &reqwest::Client {
         &self.http
     }
 
-    fn build_http(with_cookies: bool) -> reqwest::Client {
-        let mut builder = reqwest::Client::builder()
+    fn build_http() -> reqwest::Client {
+        reqwest::Client::builder()
             .user_agent(WEB_MUSIC.ua)
             .timeout(std::time::Duration::from_secs(20))
-            .connect_timeout(std::time::Duration::from_secs(10));
-        if with_cookies {
-            builder = builder.cookie_store(true);
-        }
-        builder.build().unwrap_or_default()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_default()
     }
 
     /// The cached visitor id, if it is still fresh.
@@ -332,8 +376,17 @@ impl YtClient {
         if ctx.music {
             req = req.header("Referer", "https://music.youtube.com/");
         }
-        if let Some(cookies) = &self.cookie_header {
-            req = req.header("Cookie", cookies);
+        if let Some(auth) = self.auth() {
+            let origin = format!("https://{}", ctx.host);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            req = req
+                .header("Cookie", auth.cookie_header)
+                .header("Authorization", sapisidhash(now, &auth.sapisid, &origin))
+                .header("X-Origin", origin)
+                .header("X-Goog-AuthUser", "0");
         }
         let resp = req
             .json(&body)
@@ -418,6 +471,29 @@ impl YtClient {
         Ok(tracks)
     }
 
+    /// The signed-in account's liked songs (YouTube Music's "Liked music"
+    /// playlist), first page. Needs cookies.
+    pub async fn liked_songs(&self, limit: usize) -> Result<Vec<Track>> {
+        if !self.has_cookies() {
+            return Err(anyhow!("sign in to see your liked songs"));
+        }
+        let body = json!({
+            "context": Self::context_for(&WEB_MUSIC, self.cached_visitor().as_deref()),
+            "browseId": "FEmusic_liked_videos",
+        });
+        let resp = self
+            .call_api(&WEB_MUSIC, "browse", body)
+            .await
+            .context("YT Music library (browse) failed")?;
+        let tracks = search::parse_search_tracks(&resp, limit);
+        if tracks.is_empty() {
+            return Err(anyhow!(
+                "no liked songs came back — the account may have none, or the sign-in is stale"
+            ));
+        }
+        Ok(tracks)
+    }
+
     /// Raw `player` response for one client. Public within the crate for the
     /// resolver.
     pub(crate) async fn player(&self, ctx: &ClientCtx, video_id: &str) -> Result<Value> {
@@ -439,6 +515,7 @@ mod tests {
     const SAMPLE_COOKIES: &str = "# Netscape HTTP Cookie File\n\
         #HttpOnly_.youtube.com\tTRUE\t/\tTRUE\t1893456000\tSID\tabc123\n\
         .youtube.com\tTRUE\t/\tFALSE\t0\tLOGIN_INFO\txyz\n\
+        .youtube.com\tTRUE\t/\tFALSE\t0\tSAPISID\tsapi\n\
         .example.com\tTRUE\t/\tFALSE\t0\tOTHER\tdropped\n\
         .youtube.com\tTRUE\t/\tFALSE\t1000\tOLD\texpired\n";
 
@@ -451,12 +528,13 @@ mod tests {
         // prefix is stripped, expired entries are dropped, comments skipped.
         assert_eq!(
             cookies.len(),
-            3,
+            4,
             "httponly kept, expired dropped; domain filtered later"
         );
         assert_eq!(cookies[0].name, "SID");
         assert_eq!(cookies[1].name, "LOGIN_INFO");
-        assert_eq!(cookies[2].name, "OTHER");
+        assert_eq!(cookies[2].name, "SAPISID");
+        assert_eq!(cookies[3].name, "OTHER");
     }
 
     #[test]
@@ -464,13 +542,34 @@ mod tests {
         let now = 1_700_000_000;
         let cookies = parse_netscape_cookies(SAMPLE_COOKIES, now);
         let header = cookie_header(&cookies).expect("header");
-        assert_eq!(header, "SID=abc123; LOGIN_INFO=xyz");
+        assert_eq!(header, "SID=abc123; LOGIN_INFO=xyz; SAPISID=sapi");
     }
 
     #[test]
     fn no_youtube_cookies_means_no_header() {
         let cookies = parse_netscape_cookies(".example.com\tTRUE\t/\tFALSE\t0\tA\tb\n", 0);
         assert!(cookie_header(&cookies).is_none());
+    }
+
+    #[test]
+    fn sapisidhash_matches_yt_dlp() {
+        // sha1("1700000000 abc https://www.youtube.com") computed with
+        // Python's hashlib, as yt-dlp does it.
+        assert_eq!(
+            sapisidhash(1_700_000_000, "abc", "https://www.youtube.com"),
+            "SAPISIDHASH 1700000000_27b236f59d4ec583d7530f2c7055d2f9c6aecf92"
+        );
+    }
+
+    #[test]
+    fn cookies_sign_in_every_clone_and_sign_out_again() {
+        let client = YtClient::new(None);
+        let engine_copy = client.clone();
+        assert!(!client.has_cookies());
+        assert!(client.set_cookies(Some(SAMPLE_COOKIES.to_string())));
+        assert!(engine_copy.has_cookies(), "the clone shares the sign-in");
+        assert!(!client.set_cookies(Some(".example.com\tTRUE\t/\tFALSE\t0\tA\tb\n".into())));
+        assert!(!engine_copy.has_cookies());
     }
 
     #[test]

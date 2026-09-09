@@ -28,9 +28,11 @@ Rust 1.95+ (rustup installs the pinned toolchain automatically), plus ALSA heade
 
 ```bash
 # Linux
-sudo apt install -y libasound2-dev pkg-config
-cargo run --release
+sudo apt install -y libasound2-dev pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev
+cargo run --release --features audio-alsa,login-webview
 ```
+
+`audio-alsa` is the sound output (without it the player runs silently against a null sink, for machines with no ALSA headers). `login-webview` is the "Sign in with Google" window, which needs WebKitGTK on Linux.
 
 Optional but recommended: `yt-dlp` on your `$PATH` — ytamp resolves streams natively and falls back to yt-dlp when YouTube's enforcement changes. See [BUILD.md](BUILD.md) for full instructions.
 

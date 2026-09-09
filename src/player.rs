@@ -64,6 +64,11 @@ struct EngineInner {
     shutdown: AtomicBool,
     fetcher: TrackFetcher,
     runtime: Runtime,
+    /// Never open the audio device: the null sink paces playback instead.
+    /// Set for engines built around an injected fetcher (the tests), which
+    /// run several at once and would otherwise fight over the one device
+    /// sink.
+    silent: bool,
 }
 
 #[derive(Default)]
@@ -101,17 +106,18 @@ impl PlayerEngine {
         let runtime = build_runtime()?;
         let handle = runtime.handle().clone();
         let fetcher = youtube_fetcher(client, handle);
-        Self::spawn_inner(commands, events, fetcher, runtime)
+        Self::spawn_inner(commands, events, fetcher, runtime, false)
     }
 
     /// Fully injectable stream source — how the offline tests feed local
-    /// WAV bytes through the real engine.
+    /// WAV bytes through the real engine. Plays into the paced null sink,
+    /// never the device.
     pub fn spawn_with_fetcher(
         commands: mpsc::Receiver<PlayerCommand>,
         events: BroadcastSender<PlayerEvent>,
         fetcher: TrackFetcher,
     ) -> Result<Self> {
-        Self::spawn_inner(commands, events, fetcher, build_runtime()?)
+        Self::spawn_inner(commands, events, fetcher, build_runtime()?, true)
     }
 
     fn spawn_inner(
@@ -119,6 +125,7 @@ impl PlayerEngine {
         events: BroadcastSender<PlayerEvent>,
         fetcher: TrackFetcher,
         runtime: Runtime,
+        silent: bool,
     ) -> Result<Self> {
         let (gen_tx, gen_rx) = watch::channel(0u64);
         let inner = Arc::new(EngineInner {
@@ -128,6 +135,7 @@ impl PlayerEngine {
             shutdown: AtomicBool::new(false),
             fetcher,
             runtime,
+            silent,
         });
 
         // Command loop.
@@ -506,7 +514,7 @@ struct EngineCtl {
 impl SessionCtl for EngineCtl {
     fn open_sink(&mut self, spec: AudioSpec) -> Result<Box<dyn SampleSink>> {
         #[cfg(feature = "audio-alsa")]
-        {
+        if !self.inner.silent {
             match crate::audio::sink::RodioSink::open(spec) {
                 Ok(sink) => return Ok(Box::new(sink)),
                 Err(e) => {

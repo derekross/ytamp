@@ -164,13 +164,11 @@ const RESIZE_PATIENCE: f64 = 1.5;
 /// the wrong size for longer than [`RESIZE_PATIENCE`]: a tiling or
 /// otherwise stubborn compositor, and the caller should reopen instead.
 fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) -> bool {
-    let current = ctx.input(|input| {
-        input
-            .viewport()
-            .inner_rect
-            .map(|rect| rect.size())
-            .unwrap_or(wanted)
-    });
+    // The screen rect, not the viewport's `inner_rect`: Wayland never
+    // reports a window position, so `inner_rect` is `None` there and the
+    // window would pass for fitted while the equalizer painted off its
+    // bottom edge.
+    let current = ctx.viewport_rect().size();
     let asked = egui::Id::new("ytamp-mini-fit");
     let since = egui::Id::new("ytamp-mini-fit-since");
     if (current - wanted).abs().max_elem() < 1.0 {
@@ -184,11 +182,13 @@ fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) -> bool {
         ctx.data_mut(|data| data.remove::<f64>(since));
         return true;
     }
-    let last: Option<f64> = ctx.data(|data| data.get_temp(asked));
-    if last.is_some_and(|last| now - last < 1.0) {
+    // A new size is asked for at once (the playlist grip moves in steps);
+    // the same size again waits a second between asks.
+    let last: Option<(f64, egui::Vec2)> = ctx.data(|data| data.get_temp(asked));
+    if last.is_some_and(|(at, size)| size == wanted && now - at < 1.0) {
         return false;
     }
-    ctx.data_mut(|data| data.insert_temp(asked, now));
+    ctx.data_mut(|data| data.insert_temp(asked, (now, wanted)));
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(wanted));
     ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(wanted));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
@@ -428,6 +428,8 @@ pub struct YtampApp {
     pub skin_url: String,
     /// The Downloads folder watch, while the setting is on.
     downloads: Option<DownloadsWatch>,
+    /// The sign-in window's process while it is open.
+    login: Option<std::process::Child>,
 
     pub mini: MiniState,
     pub toasts: Vec<Toast>,
@@ -479,7 +481,15 @@ impl YtampApp {
         let mut events = None;
         let mut cmd_handle = None;
         let mut engine_handle = None;
-        match PlayerEngine::spawn(cmd_rx, event_tx.clone()) {
+        let cookies = settings
+            .cookie_path
+            .as_deref()
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .filter(|text| !text.trim().is_empty());
+        // One client, shared with the engine: signing in later reaches
+        // both, because `YtClient` clones share their credentials.
+        let yt = Arc::new(YtClient::new(cookies));
+        match PlayerEngine::spawn_with(cmd_rx, event_tx.clone(), (*yt).clone()) {
             Ok(engine) => {
                 engine_handle = Some(engine);
                 events = Some(event_tx.subscribe());
@@ -497,15 +507,6 @@ impl YtampApp {
         let (skin_request_tx, skin_request_rx) = std::sync::mpsc::channel();
         // Mini-player host echoes (volume/EQ changed through HostView).
         let (echo_tx, echo_rx) = std::sync::mpsc::channel();
-
-        let cookies = settings
-            .cookie_path
-            .as_deref()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .filter(|text| !text.trim().is_empty());
-        // INTEGRATOR: if Builder B's YtClient::new wants a path or a parsed
-        // jar instead of raw cookie text, adapt here only.
-        let yt = Arc::new(YtClient::new(cookies));
 
         let mut app = Self {
             mini: MiniState {
@@ -539,6 +540,7 @@ impl YtampApp {
             skin_list_at: None,
             skin_url: String::new(),
             downloads: None,
+            login: None,
             toasts: Vec::new(),
             switch_intent: false,
             view: View::default(),
@@ -599,6 +601,7 @@ impl YtampApp {
         self.drain_skin_requests();
         self.drain_echoes();
         self.poll_downloads();
+        self.poll_login();
         self.tick_toasts();
         self.save_if_due();
         if self
@@ -625,6 +628,9 @@ impl YtampApp {
         }
         if self.downloads.is_some() {
             ctx.request_repaint_after(DownloadsWatch::PERIOD);
+        }
+        if self.login.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
         }
     }
 
@@ -801,14 +807,88 @@ impl YtampApp {
             .as_deref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .filter(|text| !text.trim().is_empty());
-        let loaded = cookies.is_some();
-        self.yt = Arc::new(YtClient::new(cookies));
-        let message = match (&path, loaded) {
-            (Some(_), true) => "Cookies loaded".to_string(),
-            (Some(p), false) => format!("Cookie file empty or missing: {p}"),
-            _ => "Cookies cleared".to_string(),
+        let present = cookies.is_some();
+        let signed_in = self.yt.set_cookies(cookies);
+        let message = match (&path, present, signed_in) {
+            (Some(_), true, true) => "Signed in: account cookies applied".to_string(),
+            (Some(p), true, false) => {
+                format!("No YouTube account cookies (SAPISID) in {p}")
+            }
+            (Some(p), false, _) => format!("Cookie file empty or missing: {p}"),
+            (None, ..) => "Signed out".to_string(),
         };
         self.toast(message);
+    }
+
+    // ---- sign-in --------------------------------------------------------
+
+    /// Whether this build can open the sign-in window.
+    pub const fn can_sign_in() -> bool {
+        cfg!(feature = "login-webview")
+    }
+
+    /// Whether the sign-in window is open.
+    pub fn signing_in(&self) -> bool {
+        self.login.is_some()
+    }
+
+    /// Opens the Google sign-in window (a child process; see
+    /// `src/login.rs`). The cookies land in the default jar and are
+    /// applied when the window closes.
+    pub fn start_login(&mut self) {
+        if self.login.is_some() {
+            return;
+        }
+        let exe = match std::env::current_exe() {
+            Ok(exe) => exe,
+            Err(error) => {
+                self.toast_error(format!(
+                    "cannot find myself to open the sign-in window: {error}"
+                ));
+                return;
+            }
+        };
+        match std::process::Command::new(exe).arg("--login").spawn() {
+            Ok(child) => {
+                self.login = Some(child);
+                self.toast("Sign in to YouTube Music in the window that opened");
+            }
+            Err(error) => self.toast_error(format!("sign-in window: {error}")),
+        }
+    }
+
+    /// Applies the jar when the sign-in window has closed.
+    fn poll_login(&mut self) {
+        let Some(child) = self.login.as_mut() else {
+            return;
+        };
+        let status = match child.try_wait() {
+            Ok(Some(status)) => status,
+            Ok(None) => return,
+            Err(error) => {
+                log::warn!("sign-in window: {error}");
+                self.login = None;
+                return;
+            }
+        };
+        self.login = None;
+        if status.success() {
+            let jar = crate::settings::default_cookie_path();
+            self.set_cookie_path(Some(jar.display().to_string()));
+        } else {
+            self.toast("Sign-in window closed without signing in");
+        }
+    }
+
+    /// Forgets the account: the jar written by the sign-in window is
+    /// deleted; a jar the user pointed at by hand is only unlinked.
+    pub fn sign_out(&mut self) {
+        if let Some(path) = self.settings.cookie_path.clone()
+            && Path::new(&path) == crate::settings::default_cookie_path()
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+        self.set_cookie_path(None);
     }
 
     // ---- search ---------------------------------------------------------
@@ -832,6 +912,28 @@ impl YtampApp {
             let outcome = match yt.search_tracks(&query, 30).await {
                 Ok(tracks) => SearchOutcome::Results { query, tracks },
                 Err(error) => SearchOutcome::Failed(format!("search failed: {error}")),
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Shows the signed-in account's liked songs in the results list.
+    pub fn begin_liked(&mut self) {
+        let title = "Liked songs".to_string();
+        self.search.committed = title.clone();
+        self.search.searching = true;
+        self.search.selected = None;
+        self.search.scroll_to = None;
+        self.view = View::Search;
+        let yt = Arc::clone(&self.yt);
+        let tx = self.search_outcome_tx.clone();
+        self.rt.spawn(async move {
+            let outcome = match yt.liked_songs(200).await {
+                Ok(tracks) => SearchOutcome::Results {
+                    query: title,
+                    tracks,
+                },
+                Err(error) => SearchOutcome::Failed(format!("liked songs: {error:#}")),
             };
             let _ = tx.send(outcome);
         });

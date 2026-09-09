@@ -31,6 +31,11 @@ struct Cli {
     #[arg(long, value_name = "FILTER")]
     log_filter: Option<String>,
 
+    /// Open the Google sign-in window and write the cookie jar, then exit.
+    /// The app runs this itself behind "Sign in with Google".
+    #[arg(long, hide = true)]
+    login: bool,
+
     /// Open under X11 (XWayland on Wayland desktops), where dropped files
     /// reach the window. Same as the setting, for one run.
     #[arg(long)]
@@ -72,6 +77,18 @@ fn main() -> eframe::Result<()> {
 
     if let Err(error) = settings::ensure_config_dirs() {
         log::warn!("unable to create the config directories: {error}");
+    }
+    if cli.login {
+        #[cfg(feature = "login-webview")]
+        if let Err(error) = ytamp::login::run(settings::default_cookie_path()) {
+            eprintln!("ytamp --login: {error:#}");
+            std::process::exit(2);
+        }
+        #[cfg(not(feature = "login-webview"))]
+        {
+            eprintln!("ytamp was built without the login-webview feature");
+            std::process::exit(2);
+        }
     }
     let settings_path = settings::config_dir().join("settings.json");
     let mut settings = Settings::load(&settings_path);

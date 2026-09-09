@@ -115,12 +115,46 @@ fn skins(app: &mut YtampApp, ui: &mut egui::Ui) {
 
 /// The optional Netscape cookie jar for account-level streams.
 fn cookies(app: &mut YtampApp, ui: &mut egui::Ui) {
-    ui.label(RichText::new("YouTube Music cookies").strong());
+    ui.label(RichText::new("YouTube Music account").strong());
     ui.add_space(4.0);
+    let signed_in = app.yt.has_cookies();
+    ui.horizontal(|ui| {
+        if signed_in {
+            ui.label(
+                RichText::new("Signed in")
+                    .small()
+                    .color(egui::Color32::from_rgb(0x7C, 0xD9, 0x92)),
+            );
+            if ui.button("Sign out").clicked() {
+                app.sign_out();
+            }
+        } else if YtampApp::can_sign_in() {
+            let button =
+                ui.add_enabled(!app.signing_in(), egui::Button::new("Sign in with Google"));
+            if button.clicked() {
+                app.start_login();
+            }
+            if app.signing_in() {
+                ui.spinner();
+                ui.label(
+                    RichText::new("waiting for the sign-in window…")
+                        .weak()
+                        .small(),
+                );
+            }
+        } else {
+            ui.label(
+                RichText::new("This build has no sign-in window (login-webview feature off).")
+                    .weak()
+                    .small(),
+            );
+        }
+    });
     ui.label(
         RichText::new(
-            "Optional: a Netscape-format cookie jar exported from your browser. \
-             With it you get your account — Premium-rate streams included.",
+            "Signing in gives you your library — liked songs, playlists — and, with \
+             Premium, 256 kbps streams. Or point at a Netscape cookies.txt exported \
+             from your browser:",
         )
         .weak()
         .small(),
