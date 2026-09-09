@@ -30,6 +30,9 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 flate2 = "1"
 # Filling glyph outlines with no anti-aliasing for the Winamp playlist text.
 tiny-skia = "0.11"
+# The font-outline parser epaint already rasterizes with; the playlist's
+# pixel text cannot use egui's own glyph runs (they are smoothed).
+skrifa = "0.44"
 
 # Audio output and decoding.
 rodio = { version = "0.21", default-features = false, features = ["playback"] }
