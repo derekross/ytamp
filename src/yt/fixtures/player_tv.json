@@ -1,0 +1,101 @@
+{
+  "responseContext": {
+    "visitorData": "CgtJSW43WU1uRzBzOCj9p4PVBjIKCgJVUxIEGgAgGA%3D%3D",
+    "serviceTrackingParams": [
+      {
+        "service": "GFEEDBACK",
+        "params": [
+          {
+            "key": "is_alc_surface",
+            "value": "false"
+          },
+          {
+            "key": "is_viewed_live",
+            "value": "False"
+          },
+          {
+            "key": "ipcc",
+            "value": "0"
+          },
+          {
+            "key": "logged_in",
+            "value": "0"
+          }
+        ]
+      }
+    ],
+    "maxAgeSeconds": 0,
+    "responseId": "IhMIv4Hb1cjglgMVxYXkBh2a6S2_"
+  },
+  "playabilityStatus": {
+    "status": "LOGIN_REQUIRED",
+    "reason": "Sign in to confirm you’re not a bot",
+    "errorScreen": {
+      "playerErrorCommandRenderer": {
+        "command": {
+          "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+          "authRequiredCommand": {
+            "identityActionContext": {
+              "eventTrigger": "ACCOUNT_EVENT_TRIGGER_VISITOR_SUSPICIOUS_REQUEST",
+              "nextEndpoint": {
+                "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+                "commandExecutorCommand": {
+                  "commands": [
+                    {
+                      "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+                      "signalAction": {
+                        "signal": "CLOSE_POPUP"
+                      }
+                    },
+                    {
+                      "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+                      "signalAction": {
+                        "signal": "RELOAD_PLAYER"
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "dismissalCommand": {
+              "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+              "commandExecutorCommand": {
+                "commands": [
+                  {
+                    "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+                    "signalAction": {
+                      "signal": "HISTORY_BACK"
+                    }
+                  },
+                  {
+                    "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+                    "signalAction": {
+                      "signal": "CLOSE_POPUP"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "trackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm"
+      }
+    },
+    "skip": {
+      "playabilityErrorSkipConfig": {
+        "skipOnPlayabilityError": false
+      }
+    },
+    "contextParams": "Q0FFU0FnZ0I="
+  },
+  "trackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+  "onResponseReceivedActions": [
+    {
+      "clickTrackingParams": "CAAQu2kiEwi_gdvVyOCWAxXFheQGHZrpLb_KAQRJ-Nmm",
+      "signalAction": {
+        "signal": "INIT_ATT_SERVICE"
+      }
+    }
+  ],
+  "adBreakHeartbeatParams": "Q0FBJTNE"
+}

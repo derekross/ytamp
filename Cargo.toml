@@ -42,6 +42,8 @@ futures-util = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros", "fs"] }
 
 rand = "0.9"
+# FFT for the spectrum analyser tap (Builder B).
+rustfft = "6"
 open = "5"
 urlencoding = "2"
 jiff = "0.2"
