@@ -42,6 +42,7 @@ pub fn show(app: &mut YtampApp, ui: &mut egui::Ui) {
     let scroll_to = app.search.scroll_to;
     let mut clicked = None;
     let mut double_clicked = None;
+    let mut play_clicked = None;
     egui::ScrollArea::vertical()
         .auto_shrink(false)
         .show(ui, |ui| {
@@ -89,6 +90,17 @@ pub fn show(app: &mut YtampApp, ui: &mut egui::Ui) {
                 });
                 row.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(8.0);
+                    if ui
+                        .add_sized(
+                            [30.0, 30.0],
+                            egui::Button::new(RichText::new("▶").size(14.0)),
+                        )
+                        .on_hover_text("Play, and start a radio after it")
+                        .clicked()
+                    {
+                        play_clicked = Some(index);
+                    }
+                    ui.add_space(6.0);
                     ui.label(
                         RichText::new(
                             track
@@ -109,7 +121,7 @@ pub fn show(app: &mut YtampApp, ui: &mut egui::Ui) {
                 }
             }
         });
-    if let Some(index) = double_clicked {
+    if let Some(index) = play_clicked.or(double_clicked) {
         app.play_result(index);
     } else if let Some(index) = clicked {
         app.search.selected = Some(index);
@@ -140,7 +152,7 @@ fn landing(app: &mut YtampApp, ui: &mut egui::Ui) {
         ui.add_space(16.0);
         ui.label(
             RichText::new(
-                "Search to start a queue — Enter or double-click plays, and a radio follows.",
+                "Type above and press Enter, then ▶ or a double-click plays a song and a radio follows.",
             )
             .weak()
             .size(12.5),

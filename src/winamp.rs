@@ -53,6 +53,16 @@ pub trait WinampHost {
     fn toggle_playlist_window(&mut self) {}
     /// The eject button's meaning is the host's: leave the mini player.
     fn leave_mini_player(&mut self) {}
+    /// The skins in the host's library, by file name, for the menu.
+    fn skin_library(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The library skin worn now; `None` for the built-in one.
+    fn worn_skin(&self) -> Option<String> {
+        None
+    }
+    /// Wear a library skin by file name, or the built-in one for `None`.
+    fn wear_skin(&mut self, _name: Option<&str>) {}
 }
 
 /// Display state for the skinned windows.

@@ -101,6 +101,59 @@ pub fn is_skin_file(path: &Path) -> bool {
     })
 }
 
+/// Where to download a skin from, and what to call the file, for a Skin
+/// Museum page link (`https://skins.webamp.org/skin/<md5>/<name>.wsz/`,
+/// served from `r2.webampskins.org`) or a direct `.wsz`/`.zip` URL.
+pub fn skin_download_for(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    if !url.starts_with("https://") && !url.starts_with("http://") {
+        return None;
+    }
+    let mut parts = url.splitn(4, '/');
+    let host = parts.nth(2).unwrap_or("");
+    let path = parts.next().unwrap_or("");
+    if host == "skins.webamp.org" || host == "webamp.org" {
+        let mut parts = path.trim_end_matches('/').split('/');
+        if parts.next() != Some("skin") {
+            return None;
+        }
+        let hash = parts.next()?;
+        if hash.len() != 32 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let name = parts
+            .next()
+            .map(|n| urlencoding::decode(n).map_or(n.to_string(), |d| d.into_owned()))
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("{hash}.wsz"));
+        let name = if is_skin_file(Path::new(&name)) {
+            name
+        } else {
+            format!("{name}.wsz")
+        };
+        return Some((
+            format!("https://r2.webampskins.org/skins/{hash}.wsz"),
+            safe_file_name(&name),
+        ));
+    }
+    let file = path.split(['?', '#']).next()?.rsplit('/').next()?;
+    let file = urlencoding::decode(file).map_or(file.to_string(), |d| d.into_owned());
+    is_skin_file(Path::new(&file)).then(|| (url.to_string(), safe_file_name(&file)))
+}
+
+/// A file name with nothing that could leave the skins directory.
+fn safe_file_name(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c == '\0' {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Fits the fixed-size mini window to its wanted size. Compositors refuse
 /// chatty resize requests, so a rejected ask retries at most once a
 /// second (fastpotify's pattern).
@@ -164,6 +217,18 @@ pub fn install_fonts(ctx: &egui::Context) {
         return;
     }
     log::debug!("typography: Inter not found on this system; egui defaults");
+}
+
+/// A skin change asked for from somewhere that cannot touch the app
+/// directly: the skinned UI's host view, or a download that finished.
+#[derive(Debug)]
+pub enum SkinRequest {
+    /// Install a file from disk (a drop).
+    File(PathBuf),
+    /// Wear a library skin by name, or the built-in one.
+    Library(Option<String>),
+    /// A download failed; the text is for a toast.
+    Failed(String),
 }
 
 /// What landed from a spawned search or radio fetch.
@@ -273,9 +338,15 @@ pub struct YtampApp {
     search_outcome_tx: std::sync::mpsc::Sender<SearchOutcome>,
     search_rx: std::sync::mpsc::Receiver<SearchOutcome>,
 
-    /// Skin loads requested from inside the Winamp UI (trait-safe deferral).
-    skin_request_tx: std::sync::mpsc::Sender<PathBuf>,
-    skin_request_rx: std::sync::mpsc::Receiver<PathBuf>,
+    /// Skin changes requested from inside the Winamp UI or by downloads.
+    skin_request_tx: std::sync::mpsc::Sender<SkinRequest>,
+    skin_request_rx: std::sync::mpsc::Receiver<SkinRequest>,
+    /// The skin library as last listed, and when; the mini player's menu
+    /// reads it every frame, so the directory is read once a second.
+    skin_list: Vec<String>,
+    skin_list_at: Option<Instant>,
+    /// The Settings page's "import from URL" box.
+    pub skin_url: String,
 
     pub mini: MiniState,
     pub toasts: Vec<Toast>,
@@ -383,6 +454,9 @@ impl YtampApp {
             search_rx,
             skin_request_tx,
             skin_request_rx,
+            skin_list: Vec::new(),
+            skin_list_at: None,
+            skin_url: String::new(),
             toasts: Vec::new(),
             switch_intent: false,
             view: View::default(),
@@ -414,6 +488,11 @@ impl YtampApp {
     /// Per-window setup: theme, image loaders, restored intent. Called every
     /// time a window is (re)created around this long-lived state.
     pub fn attach(&mut self, ctx: &egui::Context) {
+        // Textures belong to the window that uploaded them; a new window
+        // has a new painter, so the skin and the playlist's text are
+        // uploaded again on their first frame.
+        self.mini.textures.clear();
+        self.mini.winamp.playlist_text.clear();
         install_theme(ctx);
         install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
@@ -438,6 +517,17 @@ impl YtampApp {
         self.drain_echoes();
         self.tick_toasts();
         self.save_if_due();
+        if self
+            .skin_list_at
+            .is_none_or(|at| at.elapsed() > Duration::from_secs(1))
+        {
+            self.skin_list = self
+                .list_skins()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            self.skin_list_at = Some(Instant::now());
+        }
 
         // Keep the loop alive for the things that move on their own.
         if self.state.playing {
@@ -510,7 +600,42 @@ impl YtampApp {
             self.toast_error(format!("could not copy skin into library: {error}"));
             return;
         }
+        self.skin_list_at = None;
         self.load_skin_by_name(&name);
+    }
+
+    /// Imports a skin from a URL: a Skin Museum page
+    /// (`skins.webamp.org/skin/<hash>/<name>.wsz/`) or a direct `.wsz`
+    /// link. The download runs in the background and lands as a
+    /// [`SkinRequest`].
+    pub fn import_skin_url(&mut self, url: &str) {
+        let Some((download, file_name)) = skin_download_for(url) else {
+            self.toast_error("Not a Skin Museum link or a .wsz URL");
+            return;
+        };
+        self.toast(format!("Downloading {}…", skin_display_label(&file_name)));
+        let dest = self.skins_dir.join(&file_name);
+        let skins_dir = self.skins_dir.clone();
+        let tx = self.skin_request_tx.clone();
+        self.rt.spawn(async move {
+            let fetched = async {
+                let response = reqwest::Client::new()
+                    .get(&download)
+                    .timeout(Duration::from_secs(60))
+                    .send()
+                    .await?
+                    .error_for_status()?;
+                let bytes = response.bytes().await?;
+                std::fs::create_dir_all(&skins_dir)?;
+                std::fs::write(&dest, &bytes)?;
+                anyhow::Ok(dest)
+            }
+            .await;
+            let _ = tx.send(match fetched {
+                Ok(path) => SkinRequest::File(path),
+                Err(error) => SkinRequest::Failed(format!("skin download failed: {error:#}")),
+            });
+        });
     }
 
     /// Loads a library skin by file name and selects it.
@@ -679,6 +804,8 @@ impl YtampApp {
             spectrum: self.spectrum.clone(),
             eq: self.settings.eq,
             skin_requests: self.skin_request_tx.clone(),
+            skin_library: self.skin_list.clone(),
+            worn_skin: self.settings.skin.clone(),
             echoes: Some(self.echo_tx.clone()),
             leave_mini: Some(self.leave_mini_requested.clone()),
             toggle_eq: Some(self.eq_toggle_requested.clone()),
@@ -787,12 +914,17 @@ impl YtampApp {
     }
 
     fn drain_skin_requests(&mut self) {
-        let mut paths = Vec::new();
-        while let Ok(path) = self.skin_request_rx.try_recv() {
-            paths.push(path);
+        let mut requests = Vec::new();
+        while let Ok(request) = self.skin_request_rx.try_recv() {
+            requests.push(request);
         }
-        for path in paths {
-            self.install_skin(&path);
+        for request in requests {
+            match request {
+                SkinRequest::File(path) => self.install_skin(&path),
+                SkinRequest::Library(Some(name)) => self.load_skin_by_name(&name),
+                SkinRequest::Library(None) => self.clear_skin(),
+                SkinRequest::Failed(text) => self.toast_error(text),
+            }
         }
     }
 
@@ -819,6 +951,7 @@ impl YtampApp {
         let ctx = ui.ctx().clone();
         self.global_keys(&ctx);
         self.handle_dropped_skins(&ctx);
+        self.handle_pasted_links(&ctx);
         self.sync_window_title(&ctx);
         if self.settings.winamp_window {
             self.frame_mini(ui);
@@ -908,6 +1041,29 @@ impl YtampApp {
         }
     }
 
+    /// A Skin Museum link or `.wsz` URL pasted anywhere but a text box
+    /// imports the skin.
+    fn handle_pasted_links(&mut self, ctx: &egui::Context) {
+        if ctx.egui_wants_keyboard_input() {
+            return;
+        }
+        let pasted: Vec<String> = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    egui::Event::Paste(text) => Some(text.trim().to_string()),
+                    _ => None,
+                })
+                .collect()
+        });
+        for text in pasted {
+            if skin_download_for(&text).is_some() {
+                self.import_skin_url(&text);
+            }
+        }
+    }
+
     /// Installs skins dropped on the window from the desktop.
     fn handle_dropped_skins(&mut self, ctx: &egui::Context) {
         let dropped: Vec<PathBuf> = ctx.input(|input| {
@@ -918,6 +1074,10 @@ impl YtampApp {
                 .map(|file| file.path().to_path_buf())
                 .collect()
         });
+        // The skinned UI forwards its own drops through the host view.
+        if self.settings.winamp_window {
+            return;
+        }
         for path in dropped {
             if is_skin_file(&path) {
                 self.install_skin(&path);
@@ -1008,6 +1168,21 @@ impl WinampHost for YtampApp {
         self.install_skin(path);
     }
 
+    fn skin_library(&self) -> Vec<String> {
+        self.skin_list.clone()
+    }
+
+    fn worn_skin(&self) -> Option<String> {
+        self.settings.skin.clone()
+    }
+
+    fn wear_skin(&mut self, name: Option<&str>) {
+        match name {
+            Some(name) => self.load_skin_by_name(name),
+            None => self.clear_skin(),
+        }
+    }
+
     fn toggle_eq_window(&mut self) {
         self.eq_open = !self.eq_open;
     }
@@ -1036,7 +1211,9 @@ pub struct HostView {
     state: PlaybackState,
     spectrum: SpectrumFrame,
     eq: EqSettings,
-    skin_requests: std::sync::mpsc::Sender<PathBuf>,
+    skin_requests: std::sync::mpsc::Sender<SkinRequest>,
+    skin_library: Vec<String>,
+    worn_skin: Option<String>,
     echoes: Option<std::sync::mpsc::Sender<HostEcho>>,
     /// Deferred intents the app folds in after the draw (borrows force it:
     /// `winamp_ui` holds `&mut mini.winamp` while the host runs).
@@ -1086,7 +1263,25 @@ impl WinampHost for HostView {
     }
 
     fn load_skin_file(&mut self, path: &Path) {
-        let _ = self.skin_requests.send(path.to_path_buf());
+        if is_skin_file(path) {
+            let _ = self
+                .skin_requests
+                .send(SkinRequest::File(path.to_path_buf()));
+        }
+    }
+
+    fn skin_library(&self) -> Vec<String> {
+        self.skin_library.clone()
+    }
+
+    fn worn_skin(&self) -> Option<String> {
+        self.worn_skin.clone()
+    }
+
+    fn wear_skin(&mut self, name: Option<&str>) {
+        let _ = self
+            .skin_requests
+            .send(SkinRequest::Library(name.map(str::to_string)));
     }
 
     fn toggle_eq_window(&mut self) {
@@ -1178,11 +1373,38 @@ mod tests {
 
         // Skin requests defer back through the app's channel.
         host.load_skin_file(Path::new("/tmp/whatever.wsz"));
-        let path = app
+        let request = app
             .skin_request_rx
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
-        assert_eq!(path, PathBuf::from("/tmp/whatever.wsz"));
+        assert!(
+            matches!(request, SkinRequest::File(path) if path == Path::new("/tmp/whatever.wsz"))
+        );
+        host.wear_skin(Some("Zaxon.wsz"));
+        let request = app
+            .skin_request_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(request, SkinRequest::Library(Some(name)) if name == "Zaxon.wsz"));
+    }
+
+    #[test]
+    fn museum_links_and_direct_urls_become_downloads() {
+        let (url, name) = skin_download_for(
+            "https://skins.webamp.org/skin/edbd0697172ad1ad1546ecf6bc5e4239/Axon_amp.wsz/",
+        )
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://r2.webampskins.org/skins/edbd0697172ad1ad1546ecf6bc5e4239.wsz"
+        );
+        assert_eq!(name, "Axon_amp.wsz");
+        let (url, name) = skin_download_for("https://example.com/dl/Some%20Skin.wsz?x=1").unwrap();
+        assert_eq!(url, "https://example.com/dl/Some%20Skin.wsz?x=1");
+        assert_eq!(name, "Some Skin.wsz");
+        assert!(skin_download_for("https://skins.webamp.org/").is_none());
+        assert!(skin_download_for("https://example.com/readme.txt").is_none());
+        assert!(skin_download_for("not a url").is_none());
     }
 
     #[test]

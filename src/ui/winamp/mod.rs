@@ -392,6 +392,7 @@ fn shade_bar(
     if title.double_clicked() {
         state.shaded = false;
     }
+    options_menu(&title, state, host);
     if view
         .button(
             layout::OPTIONS_BUTTON,
@@ -558,6 +559,7 @@ fn title_bar(
     if title.double_clicked() {
         state.shaded = true;
     }
+    options_menu(&title, state, host);
     // The logo and the close button lead back to the big window: the mini
     // player is a way of looking at the same app, not a second one to
     // close.
@@ -614,20 +616,19 @@ fn title_bar(
 /// the visualiser. Each lights while held; D stays lit while past 1x.
 fn clutter_bar(view: &mut View, state: &mut WinampState, host: &mut dyn WinampHost) {
     view.sprite(sprites::CLUTTER_BAR, layout::CLUTTER_BAR);
-    // O opened Winamp's options menu; here it leaves for the big window,
-    // where the settings live.
-    if view
+    // O opens the options menu, as it did: skins, size, and the way back
+    // to the big window (a right-click on the title bar opens it too).
+    let options = view
         .lamp_button(
             layout::CLUTTER_O,
             sprites::CLUTTER_O_LIT,
             false,
             "clutter-o",
         )
-        .on_hover_text("Options (in the big window)")
-        .clicked()
-    {
-        host.leave_mini_player();
-    }
+        .on_hover_text("Options");
+    egui::Popup::menu(&options)
+        .id(Id::new("winamp-options-o"))
+        .show(|ui| options_menu_items(ui, state, host));
     // A was "always on top"; the host owns window level, so the lamp is
     // decorative until the host wires it.
     view.lamp_button(
@@ -891,7 +892,10 @@ fn marquee(view: &mut View, state: &mut WinampState, host: &mut dyn WinampHost) 
     );
     let (shown, offset) = state.marquee(&text, Instant::now());
     if text.chars().all(font::covered) {
-        view.text(&shown, layout::MARQUEE);
+        // Padded to the display's width: the blank glyph paints over
+        // whatever the skin drew under the marquee, as Winamp did.
+        let padded = format!("{shown:<width$}", width = crate::winamp::MARQUEE_CHARS);
+        view.text(&padded, layout::MARQUEE);
     } else {
         // The skin's bitmap font cannot say this (Japanese, say, came out
         // as question marks): the whole line is rasterised in the pixel
@@ -1208,6 +1212,86 @@ fn shuffle_repeat(view: &mut View, state: &mut WinampState, _host: &mut dyn Wina
         .clicked()
     {
         state.repeat = !state.repeat;
+    }
+}
+
+/// The options menu behind a right-click on a title bar.
+fn options_menu(title: &Response, state: &mut WinampState, host: &mut dyn WinampHost) {
+    egui::Popup::context_menu(title)
+        .id(Id::new("winamp-options"))
+        .show(|ui| options_menu_items(ui, state, host));
+}
+
+/// What the options menu offers: the big window, the skin library, the
+/// size, and the windows that hang below.
+fn options_menu_items(ui: &mut Ui, state: &mut WinampState, host: &mut dyn WinampHost) {
+    ui.set_min_width(180.0);
+    if ui.button("Back to the big window").clicked() {
+        host.leave_mini_player();
+        ui.close();
+    }
+    ui.separator();
+    let worn = host.worn_skin();
+    ui.menu_button("Skin", |ui| {
+        ui.set_min_width(200.0);
+        if ui.selectable_label(worn.is_none(), "Built-in").clicked() {
+            host.wear_skin(None);
+            ui.close();
+        }
+        let library = host.skin_library();
+        if !library.is_empty() {
+            ui.separator();
+        }
+        for name in library {
+            let label = crate::app::skin_display_label(&name).to_string();
+            if ui
+                .selectable_label(worn.as_deref() == Some(name.as_str()), label)
+                .clicked()
+            {
+                host.wear_skin(Some(&name));
+                ui.close();
+            }
+        }
+        ui.separator();
+        ui.label(
+            egui::RichText::new(
+                "Drop a .wsz here, or paste a Skin Museum link (Ctrl+V) to import one.",
+            )
+            .weak()
+            .small(),
+        );
+    });
+    ui.menu_button("Size", |ui| {
+        for scale in 1..=MAX_SCALE {
+            if ui
+                .selectable_label(state.scale == scale, format!("{scale}x"))
+                .clicked()
+            {
+                state.scale = scale;
+                ui.close();
+            }
+        }
+    });
+    ui.separator();
+    if ui.selectable_label(state.eq_open, "Equalizer").clicked() {
+        state.eq_open = !state.eq_open;
+        host.toggle_eq_window();
+        ui.close();
+    }
+    if ui
+        .selectable_label(state.playlist_open, "Playlist")
+        .clicked()
+    {
+        state.playlist_open = !state.playlist_open;
+        host.toggle_playlist_window();
+        ui.close();
+    }
+    if ui
+        .selectable_label(state.time_remaining, "Time remaining")
+        .clicked()
+    {
+        state.time_remaining = !state.time_remaining;
+        ui.close();
     }
 }
 

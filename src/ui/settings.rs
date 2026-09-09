@@ -56,6 +56,33 @@ fn skins(app: &mut YtampApp, ui: &mut egui::Ui) {
         app.toggle_mini();
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
     }
+    ui.add_space(6.0);
+    ui.label(RichText::new("Import a skin").strong().small());
+    ui.horizontal(|ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut app.skin_url)
+                .hint_text("Paste a Skin Museum link or a .wsz URL")
+                .desired_width((ui.available_width() - 90.0).max(120.0))
+                .font(egui::TextStyle::Small),
+        );
+        let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+        if (ui.button("Import").clicked() || entered) && !app.skin_url.trim().is_empty() {
+            let url = app.skin_url.trim().to_string();
+            app.import_skin_url(&url);
+            app.skin_url.clear();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new("Thousands of classic skins live at")
+                .weak()
+                .small(),
+        );
+        ui.hyperlink_to(
+            RichText::new("skins.webamp.org").small(),
+            "https://skins.webamp.org/",
+        );
+    });
     ui.label(
         RichText::new(format!(
             "Skin library: {} — drop a .wsz anywhere to install.",
