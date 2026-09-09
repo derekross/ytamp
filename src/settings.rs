@@ -234,20 +234,32 @@ mod tests {
 
         assert_eq!(settings.search_history.len(), 12);
         assert_eq!(settings.search_history[0], "query 12");
-        assert_eq!(settings.search_history.iter().filter(|q| *q == "query 12").count(), 1);
+        assert_eq!(
+            settings
+                .search_history
+                .iter()
+                .filter(|q| *q == "query 12")
+                .count(),
+            1
+        );
         settings.remember_search("   ");
         assert_eq!(settings.search_history.len(), 12);
     }
 
     #[test]
     fn eq_band_labels_match_winamp() {
-        let labels: Vec<String> = EQ_BAND_CENTERS_HZ.iter().map(|hz| eq_band_label(*hz)).collect();
+        let labels: Vec<String> = EQ_BAND_CENTERS_HZ
+            .iter()
+            .map(|hz| eq_band_label(*hz))
+            .collect();
         assert_eq!(
             labels,
-            ["60", "170", "310", "600", "1k", "3k", "6k", "12k", "14k", "16k"]
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
+            [
+                "60", "170", "310", "600", "1k", "3k", "6k", "12k", "14k", "16k"
+            ]
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
         );
     }
 }

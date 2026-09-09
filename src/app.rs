@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 
-use crate::model::{PlayerCommand, PlayerEvent, PlaybackState, SpectrumFrame, Track};
+use crate::model::{PlaybackState, PlayerCommand, PlayerEvent, SpectrumFrame, Track};
 use crate::settings::{EqSettings, Settings};
 
 // INTEGRATOR: after Builder A's branch lands, replace these re-exports with
@@ -71,14 +71,21 @@ pub mod standins {
     impl std::error::Error for SkinError {}
 
     impl Skin {
+        /// The built-in look, worn when no archive is loaded.
+        pub fn builtin() -> Skin {
+            Skin {
+                name: "built-in".into(),
+            }
+        }
+
         /// INTEGRATOR: swap to the real parser (zip + BMP sprite sheets).
         pub fn load(path: &Path) -> Result<Skin, SkinError> {
             let name = path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "skin".into());
-            let bytes = std::fs::read(path)
-                .map_err(|e| SkinError(format!("{}: {e}", path.display())))?;
+            let bytes =
+                std::fs::read(path).map_err(|e| SkinError(format!("{}: {e}", path.display())))?;
             Self::from_archive(&name, &bytes)
         }
 
@@ -111,6 +118,14 @@ pub mod standins {
         pub last_pos: Option<[f32; 2]>,
         /// Stand-in only: the ✕ button asked to leave mini mode.
         pub wants_exit: bool,
+        /// Stand-in only: the EQ button asked to flip the EQ panel.
+        pub wants_eq: bool,
+        /// Stand-in only: whether the EQ panel is open (mirrors the app's
+        /// `eq_open`, decided here so the shell stays out of the draw).
+        pub eq_open: bool,
+        /// Stand-in only: the EQ sliders' working copy; each twist goes to
+        /// the engine through `SetEq` and comes back via the echo channel.
+        pub eq_scratch: EqSettings,
     }
 
     impl Default for WinampState {
@@ -121,6 +136,9 @@ pub mod standins {
                 restore_pos: None,
                 last_pos: None,
                 wants_exit: false,
+                wants_eq: false,
+                eq_open: false,
+                eq_scratch: EqSettings::default(),
             }
         }
     }
@@ -154,7 +172,7 @@ pub mod standins {
         mini_player::draw(ui, state, skin, host);
     }
 
-    mod mini_player;
+    pub mod mini_player;
 
     // ------------------------------------------------------------------
     // Builder B: player engine (src/player.rs, src/audio/*)
@@ -242,7 +260,7 @@ pub mod standins {
                 state.queue_index = Some(index);
                 state.track = Some(track.clone());
                 state.position_secs = 0.0;
-                state.duration_secs = track.duration_secs.map(f64::from);
+                state.duration_secs = track.duration_secs.map(|duration| duration as f64);
                 state.playing = true;
             }
         };
@@ -373,15 +391,14 @@ pub mod standins {
             },
             artist: CANNED_ARTISTS[i % CANNED_ARTISTS.len()].into(),
             album: Some("Canned Results".into()),
-            duration_secs: Some(150 + (i * 37) % 240),
+            duration_secs: Some((150 + (i * 37) % 240) as u64),
             thumb_url: None,
         }
     }
 
     /// An 11-character deterministic id, YouTube-shaped.
     fn canned_video_id(seed: &str, i: usize) -> String {
-        const ALPHABET: &[u8] =
-            b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_";
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
         for b in seed.bytes().chain((i as u64).to_le_bytes()) {
             h ^= u64::from(b);
@@ -401,20 +418,96 @@ pub mod standins {
 /// A skin file name without its archive extension, for showing.
 pub fn skin_display_label(name: &str) -> &str {
     name.rsplit_once('.')
-        .filter(|(_, ext)| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "wsz" | "wal" | "zip"
-            )
-        })
+        .filter(|(_, ext)| matches!(ext.to_ascii_lowercase().as_str(), "wsz" | "wal" | "zip"))
         .map_or(name, |(stem, _)| stem)
+}
+
+/// True for `.wsz` / `.wal` / `.zip` skin archives.
+pub fn is_skin_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        matches!(
+            ext.to_string_lossy().to_ascii_lowercase().as_str(),
+            "wsz" | "wal" | "zip"
+        )
+    })
+}
+
+/// Fits the fixed-size mini window to its wanted size. Compositors refuse
+/// chatty resize requests, so a rejected ask retries at most once a
+/// second (fastpotify's pattern).
+fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) {
+    let current = ctx.input(|input| {
+        input
+            .viewport()
+            .inner_rect
+            .map(|rect| rect.size())
+            .unwrap_or(wanted)
+    });
+    if (current - wanted).abs().max_elem() < 1.0 {
+        return;
+    }
+    let asked = egui::Id::new("ytamp-mini-fit");
+    let now = ctx.input(|input| input.time);
+    let last: Option<f64> = ctx.data(|data| data.get_temp(asked));
+    if last.is_some_and(|last| now - last < 1.0) {
+        return;
+    }
+    ctx.data_mut(|data| data.insert_temp(asked, now));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(wanted));
+    ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(wanted));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+}
+
+/// Installs Inter as the proportional font when the system has it; egui's
+/// defaults otherwise (docs/DESIGN.md: Inter is the shell's face).
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut candidates: Vec<PathBuf> = [
+        "/usr/share/fonts/inter/Inter-Regular.ttf",
+        "/usr/share/fonts/truetype/inter/Inter-Regular.ttf",
+        "/usr/share/fonts/inter/InterVariable.ttf",
+        "/Library/Fonts/Inter-Regular.otf",
+        "/Library/Fonts/InterVariable.ttf",
+        "C:\\Windows\\Fonts\\Inter-Regular.ttf",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".local/share/fonts/Inter-Regular.ttf"));
+        candidates.push(home.join(".local/share/fonts/InterVariable.ttf"));
+        candidates.push(home.join(".fonts/Inter-Regular.ttf"));
+    }
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("Inter".into(), egui::FontData::from_owned(bytes).into());
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "Inter".into());
+        ctx.set_fonts(fonts);
+        log::info!("typography: Inter from {}", path.display());
+        return;
+    }
+    log::debug!("typography: Inter not found on this system; egui defaults");
 }
 
 /// What landed from a spawned search or radio fetch.
 #[derive(Debug)]
 pub enum SearchOutcome {
-    Results { query: String, tracks: Vec<Track> },
-    Radio { video_id: String, tracks: Vec<Track> },
+    Results {
+        query: String,
+        tracks: Vec<Track>,
+    },
+    Radio {
+        video_id: String,
+        tracks: Vec<Track>,
+    },
     Failed(String),
 }
 
@@ -511,6 +604,13 @@ pub struct YtampApp {
     pub scrub: Option<f64>,
     /// The skins library directory (injected for tests).
     pub skins_dir: PathBuf,
+    /// Whether the queue side panel is open in the main window.
+    pub show_queue: bool,
+    /// The last window title sent to the viewport.
+    window_title: String,
+    /// Echoes from the mini player's host view (volume/EQ turns).
+    echo_tx: std::sync::mpsc::Sender<HostEcho>,
+    echo_rx: std::sync::mpsc::Receiver<HostEcho>,
 }
 
 impl YtampApp {
@@ -529,7 +629,7 @@ impl YtampApp {
         // Player engine, DESIGN.md contract shape.
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, _) = broadcast::channel(512);
-        let mut engine_note = None;
+        let engine_note;
         let mut events = None;
         let mut cmd_handle = None;
         match PlayerEngine::spawn(cmd_rx, event_tx.clone()) {
@@ -547,6 +647,8 @@ impl YtampApp {
         // Search pipeline + trait-deferred skin loads.
         let (search_outcome_tx, search_rx) = std::sync::mpsc::channel();
         let (skin_request_tx, skin_request_rx) = std::sync::mpsc::channel();
+        // Mini-player host echoes (volume/EQ changed through HostView).
+        let (echo_tx, echo_rx) = std::sync::mpsc::channel();
 
         let cookies = settings
             .cookie_path
@@ -587,6 +689,10 @@ impl YtampApp {
             eq_open: false,
             scrub: None,
             skins_dir,
+            show_queue: true,
+            window_title: "ytamp".into(),
+            echo_tx,
+            echo_rx,
         };
         app.state.volume = app.settings.volume;
 
@@ -606,6 +712,7 @@ impl YtampApp {
     /// time a window is (re)created around this long-lived state.
     pub fn attach(&mut self, ctx: &egui::Context) {
         install_theme(ctx);
+        install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
         self.switch_intent = false;
         if self.settings.winamp_window {
@@ -625,6 +732,7 @@ impl YtampApp {
         self.drain_events();
         self.drain_search();
         self.drain_skin_requests();
+        self.drain_echoes();
         self.tick_toasts();
         self.save_if_due();
 
@@ -704,7 +812,7 @@ impl YtampApp {
     }
 
     /// Loads a library skin by file name and selects it.
-    fn load_skin_by_name(&mut self, name: &str) {
+    pub fn load_skin_by_name(&mut self, name: &str) {
         let path = self.skins_dir.join(name);
         match Skin::load(&path) {
             Ok(skin) => {
@@ -732,15 +840,7 @@ impl YtampApp {
             .flatten()
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| {
-                path.is_file()
-                    && path.extension().is_some_and(|ext| {
-                        matches!(
-                            ext.to_string_lossy().to_ascii_lowercase().as_str(),
-                            "wsz" | "wal" | "zip"
-                        )
-                    })
-            })
+            .filter(|path| path.is_file() && is_skin_file(path))
             .filter_map(|path| {
                 let name = path.file_name()?.to_string_lossy().into_owned();
                 Some((name, path))
@@ -763,7 +863,7 @@ impl YtampApp {
         let loaded = cookies.is_some();
         self.yt = Arc::new(YtClient::new(cookies));
         let message = match (&path, loaded) {
-            (Some(p), true) => "Cookies loaded".to_string(),
+            (Some(_), true) => "Cookies loaded".to_string(),
             (Some(p), false) => format!("Cookie file empty or missing: {p}"),
             _ => "Cookies cleared".to_string(),
         };
@@ -837,8 +937,12 @@ impl YtampApp {
             }
             SearchOutcome::Radio { video_id, tracks } => {
                 // Skip anything the queue already holds.
-                let mut known: Vec<String> =
-                    self.state.queue.iter().map(|t| t.video_id.clone()).collect();
+                let mut known: Vec<String> = self
+                    .state
+                    .queue
+                    .iter()
+                    .map(|t| t.video_id.clone())
+                    .collect();
                 if self.search.results.iter().any(|t| t.video_id == video_id) {
                     known.push(video_id.clone());
                 }
@@ -873,6 +977,7 @@ impl YtampApp {
             spectrum: self.spectrum.clone(),
             eq: self.settings.eq,
             skin_requests: self.skin_request_tx.clone(),
+            echoes: Some(self.echo_tx.clone()),
         }
     }
 
@@ -929,17 +1034,18 @@ impl YtampApp {
 
     // ---- drains -----------------------------------------------------------
 
+    /// Drains the engine's broadcast channel into the app's snapshots.
     fn drain_events(&mut self) {
         let Some(events) = &mut self.events else {
             return;
         };
+        // Collected first: applying a toast takes `&mut self`, which the
+        // receiver borrow above cannot share.
+        let mut incoming = Vec::new();
         let mut closed = false;
         loop {
             match events.try_recv() {
-                Ok(PlayerEvent::State(state)) => self.state = state,
-                Ok(PlayerEvent::Spectrum(frame)) => self.spectrum = frame,
-                Ok(PlayerEvent::Error(text)) => self.toast_error(text),
-                Ok(PlayerEvent::Info(text)) => self.toast(text),
+                Ok(event) => incoming.push(event),
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
                     log::debug!("skipped {skipped} player events");
@@ -948,6 +1054,14 @@ impl YtampApp {
                     closed = true;
                     break;
                 }
+            }
+        }
+        for event in incoming {
+            match event {
+                PlayerEvent::State(state) => self.state = state,
+                PlayerEvent::Spectrum(frame) => self.spectrum = frame,
+                PlayerEvent::Error(text) => self.toast_error(text),
+                PlayerEvent::Info(text) => self.toast(text),
             }
         }
         if closed {
@@ -976,6 +1090,188 @@ impl YtampApp {
             self.install_skin(&path);
         }
     }
+
+    fn drain_echoes(&mut self) {
+        while let Ok(echo) = self.echo_rx.try_recv() {
+            match echo {
+                HostEcho::Volume(volume) => {
+                    self.settings.volume = volume.clamp(0.0, 1.0);
+                    self.mark_dirty();
+                }
+                HostEcho::Eq(eq) => {
+                    self.settings.eq = eq;
+                    self.mark_dirty();
+                }
+            }
+        }
+    }
+
+    // ---- the frame ------------------------------------------------------
+
+    /// One frame of drawing for whichever window mode is open. The eframe
+    /// `Shell` in `main.rs` calls this with the root `Ui`.
+    pub fn frame_ui(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        self.global_keys(&ctx);
+        self.handle_dropped_skins(&ctx);
+        self.sync_window_title(&ctx);
+        if self.settings.winamp_window {
+            self.frame_mini(ui);
+        } else {
+            crate::ui::show(self, ui);
+        }
+        self.draw_toasts(&ctx);
+    }
+
+    /// The mini player's frame: remember where the window is, fit it to
+    /// its wanted size, draw through the stand-in renderer, then fold its
+    /// deferred intents back into the app.
+    fn frame_mini(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        if let Some(rect) = ctx.input(|input| input.viewport().outer_rect) {
+            self.mini.winamp.last_pos = Some([rect.min.x, rect.min.y]);
+        }
+        self.mini.winamp.eq_open = self.eq_open;
+        self.mini.winamp.eq_scratch = self.settings.eq;
+        let wanted = standins::mini_player::desired_window_size(&self.mini.winamp);
+        fit_mini_window(&ctx, wanted);
+
+        let builtin;
+        let skin = match &self.mini.skin {
+            Some(skin) => skin,
+            None => {
+                builtin = Skin::builtin();
+                &builtin
+            }
+        };
+        let mut host = self.host_snapshot();
+        winamp_ui(
+            ui,
+            &mut self.mini.winamp,
+            skin,
+            &mut host,
+            &mut self.mini.textures,
+        );
+
+        if self.mini.winamp.wants_exit {
+            self.mini.winamp.wants_exit = false;
+            self.toggle_mini();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.mini.winamp.wants_eq {
+            self.mini.winamp.wants_eq = false;
+            self.eq_open = !self.eq_open;
+        }
+        let scale = self.mini.winamp.scale.clamp(1, 4);
+        if scale != self.settings.skin_scale {
+            self.mini.winamp.scale = scale;
+            self.settings.skin_scale = scale;
+            self.mark_dirty();
+        }
+    }
+
+    /// Ctrl+M flips main <-> mini in either mode; the shell's window loop
+    /// reopens as the other kind.
+    fn global_keys(&mut self, ctx: &egui::Context) {
+        let mut toggle = false;
+        ctx.input(|input| {
+            for event in &input.events {
+                let egui::Event::Key {
+                    key: egui::Key::M,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } = event
+                else {
+                    continue;
+                };
+                if modifiers.ctrl && !modifiers.shift {
+                    toggle = true;
+                }
+            }
+        });
+        if toggle {
+            self.toggle_mini();
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Installs skins dropped on the window from the desktop.
+    fn handle_dropped_skins(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        for path in dropped {
+            if is_skin_file(&path) {
+                self.install_skin(&path);
+            }
+        }
+    }
+
+    /// Keeps the running track in the window and taskbar title.
+    fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let title = match (&self.state.playing, &self.state.track) {
+            (true, Some(track)) => format!("{} — ytamp", track.display()),
+            _ => "ytamp".to_owned(),
+        };
+        if title != self.window_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = title;
+        }
+    }
+
+    /// The banner stack, bottom-center; click one to dismiss it.
+    fn draw_toasts(&mut self, ctx: &egui::Context) {
+        if self.toasts.is_empty() {
+            return;
+        }
+        let mut dismiss = None;
+        egui::Area::new(egui::Id::new("ytamp-toasts"))
+            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -18.0))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_max_width(460.0);
+                ui.vertical(|ui| {
+                    for (index, toast) in self.toasts.iter().enumerate() {
+                        let (mark, stroke) = if toast.kind == ToastKind::Error {
+                            (
+                                "⚠",
+                                egui::Stroke::new(1.0, egui::Color32::from_rgb(0xE8, 0x6A, 0x5A)),
+                            )
+                        } else {
+                            ("ⓘ", egui::Stroke::NONE)
+                        };
+                        let response = egui::Frame::window(ui.style())
+                            .fill(egui::Color32::from_rgb(0x1E, 0x1B, 0x2A))
+                            .stroke(stroke)
+                            .corner_radius(egui::CornerRadius::same(6))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.set_min_width(360.0);
+                                ui.horizontal(|ui| {
+                                    ui.label(mark);
+                                    ui.add(
+                                        egui::Label::new(egui::RichText::new(&toast.text).weak())
+                                            .wrap(),
+                                    );
+                                });
+                            })
+                            .response;
+                        if response.clicked() {
+                            dismiss = Some(index);
+                        }
+                    }
+                });
+            });
+        if let Some(index) = dismiss {
+            self.toasts.remove(index);
+        }
+    }
 }
 
 /// The frozen host trait implementation over the whole app.
@@ -1001,6 +1297,14 @@ impl WinampHost for YtampApp {
     }
 }
 
+/// What the mini player changed through its host view this frame; the
+/// shell folds these back into settings so the knobs persist.
+#[derive(Debug)]
+enum HostEcho {
+    Volume(f32),
+    Eq(EqSettings),
+}
+
 /// One-frame owned host view; see [`YtampApp::host_snapshot`].
 pub struct HostView {
     commands: Option<mpsc::Sender<PlayerCommand>>,
@@ -1008,10 +1312,32 @@ pub struct HostView {
     spectrum: SpectrumFrame,
     eq: EqSettings,
     skin_requests: std::sync::mpsc::Sender<PathBuf>,
+    echoes: Option<std::sync::mpsc::Sender<HostEcho>>,
 }
 
 impl WinampHost for HostView {
     fn cmd(&mut self, c: PlayerCommand) {
+        // Volume and EQ turns also echo to the app, which persists them;
+        // everything still goes to the engine.
+        if let Some(echoes) = &self.echoes {
+            match &c {
+                PlayerCommand::SetVolume(volume) => {
+                    let _ = echoes.send(HostEcho::Volume(*volume));
+                }
+                PlayerCommand::SetEq {
+                    enabled,
+                    gains_db,
+                    preamp_db,
+                } => {
+                    let _ = echoes.send(HostEcho::Eq(EqSettings {
+                        enabled: *enabled,
+                        gains_db: *gains_db,
+                        preamp_db: *preamp_db,
+                    }));
+                }
+                _ => {}
+            }
+        }
         if let Some(tx) = &self.commands {
             let _ = tx.try_send(c);
         }
@@ -1045,30 +1371,37 @@ pub fn install_theme(ctx: &egui::Context) {
     let text = egui::Color32::from_rgb(0xE7, 0xE5, 0xF0);
     let dim = egui::Color32::from_rgb(0x9C, 0x98, 0xAD);
 
-    ctx.set_visuals(egui::Visuals::dark());
-    ctx.style_mut(|style| {
-        let visuals = &mut style.visuals;
-        visuals.panel_fill = window;
-        visuals.faint_bg_color = card;
-        visuals.extreme_bg_color = egui::Color32::from_rgb(0x0C, 0x0B, 0x10);
-        visuals.code_bg_color = card;
-        visuals.hyperlink_color = accent_bright;
-        visuals.selection.bg_fill = accent;
-        visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.noninteractive.bg_fill = panel;
-        visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, dim);
-        visuals.widgets.inactive.bg_fill = card;
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text);
-        visuals.widgets.hovered.bg_fill = accent_soft;
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.active.bg_fill = accent;
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.open.bg_fill = accent_soft;
-        visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, text);
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = window;
+    visuals.faint_bg_color = card;
+    visuals.extreme_bg_color = egui::Color32::from_rgb(0x0C, 0x0B, 0x10);
+    visuals.code_bg_color = card;
+    visuals.hyperlink_color = accent_bright;
+    visuals.selection.bg_fill = accent;
+    visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.noninteractive.bg_fill = panel;
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, dim);
+    visuals.widgets.inactive.bg_fill = card;
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text);
+    visuals.widgets.hovered.bg_fill = accent_soft;
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    visuals.widgets.open.bg_fill = accent_soft;
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, text);
 
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
-    });
+    // Written for both themes and the selection pinned to dark: the app is
+    // a night thing.
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.set_visuals_of(theme, visuals.clone());
+    }
+    ctx.set_theme(egui::ThemePreference::Dark);
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        ctx.style_mut_of(theme, |style| {
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(10.0, 5.0);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -1215,7 +1548,10 @@ mod tests {
         let mut radio: Vec<Track> = seed.clone();
         radio.push(standins::canned_track("radio:x", 0));
         let video_id = seed[0].video_id.clone();
-        app.apply_search_outcome(SearchOutcome::Radio { video_id, tracks: radio });
+        app.apply_search_outcome(SearchOutcome::Radio {
+            video_id,
+            tracks: radio,
+        });
 
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && app.state.queue.len() < 4 {
