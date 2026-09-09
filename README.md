@@ -40,7 +40,7 @@ Drag a `.wsz` file onto the mini player (Ctrl+M to open it), or drop skins in `~
 
 ## Attribution
 
-- The Winamp skin engine (`.wsz` parsing, sprite rendering, pixel text, EQ and visualizer) is adapted from [crmne/fastpotify](https://github.com/crmne/fastpotify), MIT licensed. Thank you — this project stands on your work.
+- The Winamp skin engine (`.wsz` parsing, sprite rendering, pixel text, EQ and visualizer) is adapted from [crmne/fastpotify](https://github.com/crmne/fastpotify), MIT licensed, and so is the built-in skin (`assets/skins/builtin.wsz`, fastpotify's own). Thank you — this project stands on your work.
 - Stream resolution follows the patterns of [yt-dlp](https://github.com/yt-dlp/yt-dlp), [youtui](https://github.com/nick42d/youtui), and [meduza-music](https://github.com/akilaisadev/meduza-music).
 
 ## Not affiliated with Google

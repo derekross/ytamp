@@ -7,9 +7,9 @@
 //! [`layout`] defines window positions. Missing files fall back to ytamp's
 //! built-in plain skin. Modern `.wal` skins are unsupported.
 //!
-//! Where fastpotify shipped a drawn `.wsz` as its built-in skin, ytamp's
-//! stand-in is generated: a flat grey skin whose sheets are sized to hold
-//! every sprite in the table, so any other skin's gaps can be filled from it.
+//! The built-in skin is fastpotify's own drawn `.wsz` (MIT), bundled in
+//! `assets/skins/builtin.wsz`; it has every sheet, so any other skin's gaps
+//! can be filled from it.
 
 pub mod config;
 pub mod font;
@@ -216,9 +216,9 @@ impl Skin {
         })
     }
 
-    /// The skin ytamp stands up when a skin of its own is missing: flat
-    /// grey, with every sheet present so any other skin's gaps can be
-    /// filled from it. It goes through no reader; it is drawn whole.
+    /// The skin ytamp wears when none is chosen: fastpotify's drawn classic
+    /// skin, with every sheet present so any other skin's gaps can be filled
+    /// from it.
     pub fn builtin() -> Arc<Skin> {
         BUILTIN.clone()
     }
@@ -230,8 +230,8 @@ impl Skin {
 
     /// Whether the time display can take its blank cell and minus sign
     /// from the skin's own digits, rather than borrowing a bar of the 2.
-    /// A skin that brought no `nums_ex` of its own — the built-in one
-    /// generated its stand-in — does without.
+    /// A skin that brought no `nums_ex` of its own does without, even
+    /// though the built-in skin's sheet stands in for the missing file.
     pub fn has_extended_digits(&self) -> bool {
         self.extended_digits
     }
@@ -282,55 +282,13 @@ fn wanted(file_name: &str) -> bool {
     matches!(extension, "bmp" | "png") && Sheet::ALL.iter().any(|sheet| sheet.file_stem() == stem)
 }
 
-/// The grey the built-in skin is filled with, close to the classic skin's.
-const BUILTIN_GREY: [u8; 3] = [61, 61, 61];
+/// The built-in skin: fastpotify's drawn classic skin (MIT), packed as a
+/// `.wsz` like any other so it goes through the same reader. It has every
+/// sheet, so any other skin's gaps can be filled from it.
+const BUILTIN_ARCHIVE: &[u8] = include_bytes!("../../assets/skins/builtin.wsz");
 
-/// A sheet of the built-in skin: the flat grey, as large as the furthest
-/// corner any sprite in the table reaches, the indexed ones included.
-fn builtin_bitmap(sheet: Sheet) -> Bitmap {
-    let indexed = [
-        sprites::volume_frame(sprites::SLIDER_FRAMES - 1),
-        sprites::balance_frame(sprites::SLIDER_FRAMES - 1),
-        sprites::digit(9),
-        sprites::digit_ex(9),
-        sprites::glyph(2, 30),
-        sprites::eq_slider_frame(sprites::EQ_SLIDER_FRAMES - 1),
-    ];
-    let mut width = 0;
-    let mut height = 0;
-    for sprite in sprites::ALL
-        .iter()
-        .map(|(_, sprite)| *sprite)
-        .chain(indexed)
-    {
-        if sprite.sheet == sheet {
-            width = width.max(sprite.x + sprite.width);
-            height = height.max(sprite.y + sprite.height);
-        }
-    }
-    let [r, g, b] = BUILTIN_GREY;
-    Bitmap {
-        width,
-        height,
-        rgba: (0..width * height).flat_map(|_| [r, g, b, 255]).collect(),
-    }
-}
-
-/// The built-in skin, generated whole rather than read from a file.
 static BUILTIN: LazyLock<Arc<Skin>> = LazyLock::new(|| {
-    let mut sheets = HashMap::new();
-    for sheet in Sheet::ALL {
-        sheets.insert(sheet, builtin_bitmap(sheet));
-    }
-    Arc::new(Skin {
-        name: "ytamp".to_string(),
-        id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        sheets,
-        extended_digits: false,
-        playlist: PlaylistStyle::default(),
-        vis_colors: config::DEFAULT_VIS_COLORS,
-        regions: Regions::default(),
-    })
+    Arc::new(Skin::from_archive("ytamp", BUILTIN_ARCHIVE).expect("the built-in skin reads"))
 });
 
 #[cfg(test)]
@@ -382,8 +340,24 @@ mod tests {
                 Some(sprite)
             );
         }
-        assert!(!skin.has_extended_digits());
+        assert!(skin.has_extended_digits());
         assert_eq!(skin.name, "ytamp");
+    }
+
+    #[test]
+    fn the_built_in_skin_is_not_blank() {
+        let skin = Skin::builtin();
+        let (bitmap, sprite) = skin.sprite(sprites::PLAY).unwrap();
+        let glyph = bitmap.crop(sprite).unwrap();
+        let distinct: std::collections::HashSet<[u8; 4]> = (0..glyph.height)
+            .flat_map(|y| (0..glyph.width).map(move |x| (x, y)))
+            .filter_map(|(x, y)| glyph.pixel(x, y))
+            .collect();
+        assert!(distinct.len() >= 3, "the play button is a flat colour");
+        let text = skin.sheet(Sheet::Text);
+        let a = text.crop(font::glyph('A')).unwrap();
+        let blank = text.crop(font::glyph(' ')).unwrap();
+        assert_ne!(a, blank);
     }
 
     #[test]
