@@ -142,25 +142,38 @@ impl NullSink {
 mod device {
     use super::*;
 
-    use anyhow::Context as _;
+    use std::sync::mpsc;
 
     /// How much audio the ring may hold ahead of the device (seconds).
     const BACKLOG_SECS: f64 = 2.0;
 
-    /// The process-wide output stream. Kept forever once opened; rebuilt
-    /// if a track arrives with a different sample rate (rare: YouTube AAC
-    /// is 44.1 kHz or 48 kHz).
-    struct Device {
-        stream: rodio::OutputStream,
-        rate: u32,
+    /// Commands for the device thread. The cpal/rodio output stream is not
+    /// safely movable between threads, so one dedicated thread opens it,
+    /// owns it, and owns the rodio sink; everyone else talks to the shared
+    /// sample ring and this channel.
+    enum DeviceCmd {
+        Open {
+            spec: AudioSpec,
+            ring: Arc<Mutex<VecDeque<f32>>>,
+            respond: mpsc::Sender<Result<(), String>>,
+        },
+        SetVolume(f32),
+        Pause,
+        Play,
+        Stop,
     }
 
-    static DEVICE: OnceLock<Mutex<Option<Device>>> = OnceLock::new();
+    static DEVICE_TX: OnceLock<mpsc::Sender<DeviceCmd>> = OnceLock::new();
 
-    fn shared_ring(spec: AudioSpec) -> Arc<Mutex<VecDeque<f32>>> {
-        Arc::new(Mutex::new(VecDeque::with_capacity(
-            spec.samples_per_sec() as usize / 4,
-        )))
+    fn device_tx() -> &'static mpsc::Sender<DeviceCmd> {
+        DEVICE_TX.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<DeviceCmd>();
+            std::thread::Builder::new()
+                .name("audio-device".into())
+                .spawn(move || device_loop(rx))
+                .expect("spawning the audio device thread");
+            tx
+        })
     }
 
     /// A pull-source over the shared sample ring. Lives on rodio's audio
@@ -173,10 +186,11 @@ mod device {
     impl Iterator for LiveSource {
         type Item = f32;
         fn next(&mut self) -> Option<f32> {
-            Some(match self.ring.lock() {
+            let sample = match self.ring.lock() {
                 Ok(mut queue) => queue.pop_front().unwrap_or(0.0),
                 Err(_) => 0.0,
-            })
+            };
+            Some(sample) // endless live stream; underruns emit silence
         }
     }
 
@@ -195,10 +209,76 @@ mod device {
         }
     }
 
+    /// Owns the output stream and the rodio sink; never leaves this thread.
+    fn device_loop(rx: mpsc::Receiver<DeviceCmd>) {
+        let mut stream: Option<rodio::OutputStream> = None;
+        let mut sink: Option<rodio::Sink> = None;
+        let mut rate = 0u32;
+        while let Ok(cmd) = rx.recv() {
+            match cmd {
+                DeviceCmd::Open {
+                    spec,
+                    ring,
+                    respond,
+                } => {
+                    // YouTube AAC is 44.1 kHz or 48 kHz; reopen only when
+                    // the rate actually changes.
+                    if stream.is_none() || rate != spec.rate {
+                        stream = None; // drop before reopening the device
+                        match rodio::OutputStreamBuilder::from_default_device().and_then(|b| {
+                            b.with_channels(spec.channels)
+                                .with_sample_rate(spec.rate)
+                                .open_stream_or_fallback()
+                        }) {
+                            Ok(opened) => {
+                                rate = spec.rate;
+                                stream = Some(opened);
+                            }
+                            Err(e) => {
+                                let _ = respond.send(Err(format!(
+                                    "opening the audio output stream (is a device present?): {e}"
+                                )));
+                                continue;
+                            }
+                        }
+                    }
+                    let opened = stream.as_ref().expect("stream just opened");
+                    let new_sink = rodio::Sink::connect_new(opened.mixer());
+                    new_sink.append(LiveSource { ring, spec });
+                    // Replacing drops the previous sink, which stops it.
+                    sink = Some(new_sink);
+                    let _ = respond.send(Ok(()));
+                }
+                DeviceCmd::SetVolume(volume) => {
+                    if let Some(s) = &sink {
+                        s.set_volume(volume);
+                    }
+                }
+                DeviceCmd::Pause => {
+                    if let Some(s) = &sink {
+                        s.pause();
+                    }
+                }
+                DeviceCmd::Play => {
+                    if let Some(s) = &sink {
+                        s.play();
+                    }
+                }
+                DeviceCmd::Stop => {
+                    if let Some(s) = &sink {
+                        s.stop();
+                    }
+                }
+            }
+        }
+    }
+
     /// Device output through rodio/cpal (needs the `audio-alsa` feature).
+    ///
+    /// A cheap handle: samples flow through the shared ring to the device
+    /// thread's live source; playback commands ride the command channel.
     pub struct RodioSink {
         ring: Arc<Mutex<VecDeque<f32>>>,
-        sink: rodio::Sink,
         spec: AudioSpec,
         volume: f32,
         backlog: usize,
@@ -207,33 +287,24 @@ mod device {
     impl RodioSink {
         /// Open (or reuse) the output stream for `spec` and start pulling.
         pub fn open(spec: AudioSpec) -> Result<Self> {
-            let cell = DEVICE.get_or_init(|| Mutex::new(None));
-            let mut guard = cell
-                .lock()
-                .map_err(|_| anyhow::anyhow!("audio device lock poisoned"))?;
-            if guard.as_ref().is_none_or(|d| d.rate != spec.rate) {
-                let stream = rodio::OutputStreamBuilder::open_default_stream()
-                    .context("opening the audio output stream (is a device present?)")?;
-                *guard = Some(Device {
-                    stream,
-                    rate: spec.rate,
-                });
-            }
-            let sink = {
-                let device = guard.as_ref().expect("device just set");
-                rodio::Sink::connect_new(device.stream.mixer())
-            };
-            drop(guard);
-
-            let ring = shared_ring(spec);
-            sink.append(LiveSource {
-                ring: ring.clone(),
-                spec,
-            });
+            let ring = Arc::new(Mutex::new(VecDeque::with_capacity(
+                spec.samples_per_sec() as usize / 4,
+            )));
+            let (respond_tx, respond_rx) = mpsc::channel();
+            device_tx()
+                .send(DeviceCmd::Open {
+                    spec,
+                    ring: ring.clone(),
+                    respond: respond_tx,
+                })
+                .map_err(|_| anyhow::anyhow!("audio device thread is gone"))?;
+            respond_rx
+                .recv()
+                .map_err(|_| anyhow::anyhow!("audio device thread died while opening"))?
+                .map_err(anyhow::Error::msg)?;
             Ok(Self {
                 backlog: (spec.samples_per_sec() as f64 * BACKLOG_SECS) as usize,
                 ring,
-                sink,
                 spec,
                 volume: 1.0,
             })
@@ -263,15 +334,15 @@ mod device {
 
         fn set_volume(&mut self, volume: f32) {
             self.volume = volume.clamp(0.0, 1.0);
-            self.sink.set_volume(self.volume);
+            let _ = device_tx().send(DeviceCmd::SetVolume(self.volume));
         }
 
         fn pause(&mut self) {
-            self.sink.pause();
+            let _ = device_tx().send(DeviceCmd::Pause);
         }
 
         fn play(&mut self) {
-            self.sink.play();
+            let _ = device_tx().send(DeviceCmd::Play);
         }
 
         fn latency_secs(&self) -> f64 {
@@ -282,7 +353,7 @@ mod device {
 
     impl Drop for RodioSink {
         fn drop(&mut self) {
-            self.sink.stop();
+            let _ = device_tx().send(DeviceCmd::Stop);
         }
     }
 }
