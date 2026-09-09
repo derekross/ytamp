@@ -48,7 +48,7 @@ fn skins(app: &mut YtampApp, ui: &mut egui::Ui) {
     ui.add(Slider::new(&mut scale, 1..=4).text("skin scale"));
     if scale != app.settings.skin_scale {
         app.settings.skin_scale = scale;
-        app.mini.winamp.scale = scale.clamp(1, 4);
+        app.mini.winamp.scale = u32::from(scale.clamp(1, 4));
         app.mark_dirty();
     }
     ui.add_space(4.0);
@@ -138,18 +138,14 @@ fn equalizer(app: &mut YtampApp, ui: &mut egui::Ui) {
     });
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        for band in 0..10 {
+        for (band, center) in EQ_BAND_CENTERS_HZ.iter().enumerate() {
             ui.vertical(|ui| {
                 ui.add(
                     egui::Slider::new(&mut eq.gains_db[band], -12.0..=12.0)
                         .vertical()
                         .show_value(false),
                 );
-                ui.label(
-                    RichText::new(eq_band_label(EQ_BAND_CENTERS_HZ[band]))
-                        .weak()
-                        .small(),
-                );
+                ui.label(RichText::new(eq_band_label(*center)).weak().small());
             });
         }
     });

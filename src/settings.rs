@@ -8,29 +8,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Equalizer snapshot the UI hands to the skin engine and the player.
-///
-/// INTEGRATOR: swap to `crate::eq::EqSettings` (Builder A) once `eq.rs`
-/// lands; keep field names `enabled`, `gains_db`, `preamp_db` so the
-/// `From` impl below becomes the constructor.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EqSettings {
-    pub enabled: bool,
-    /// Band gains in dB, 60 Hz .. 16 kHz (Winamp's classic curve).
-    pub gains_db: [f64; 10],
-    /// Pre-amp gain in dB, usually <= 0.
-    pub preamp_db: f64,
-}
-
-impl Default for EqSettings {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            gains_db: [0.0; 10],
-            preamp_db: 0.0,
-        }
-    }
-}
+/// The equalizer snapshot is the engine's (Builder A); re-exported here
+/// so settings code and the shell keep the `settings::EqSettings` path.
+pub use crate::eq::EqSettings;
 
 /// Winamp's ten band centers, in Hz, low to high.
 pub const EQ_BAND_CENTERS_HZ: [f64; 10] = [
@@ -207,9 +187,11 @@ mod tests {
         let path = dir.path().join("settings.json");
         assert_eq!(Settings::load(&path), Settings::default());
 
-        let mut settings = Settings::default();
-        settings.volume = 0.9;
-        settings.skin = Some("Zaxon.wsz".into());
+        let settings = Settings {
+            volume: 0.9,
+            skin: Some("Zaxon.wsz".into()),
+            ..Settings::default()
+        };
         settings.save(&path);
 
         assert_eq!(Settings::load(&path), settings);

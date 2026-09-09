@@ -4,7 +4,7 @@
 use egui::{Key, RichText, Slider};
 
 use crate::app::YtampApp;
-use crate::app::standins::mini_player::fmt_time;
+use crate::app::fmt_time;
 use crate::model::PlayerCommand;
 
 /// The whole main window, into the root `Ui` the shell hands us.

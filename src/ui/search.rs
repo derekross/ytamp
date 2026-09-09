@@ -3,7 +3,7 @@
 use egui::{Align, Color32, CornerRadius, Layout, RichText, vec2};
 
 use crate::app::YtampApp;
-use crate::app::standins::mini_player::fmt_time;
+use crate::app::fmt_time;
 use crate::model::Track;
 
 /// The search view: a landing page before the first query, then results.

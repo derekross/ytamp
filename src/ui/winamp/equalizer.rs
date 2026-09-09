@@ -90,10 +90,13 @@ pub(super) fn show(
         .button(layout::EQ_ON, normal, pressed, "eq-on")
         .clicked()
     {
-        send(host, EqSettings {
-            enabled: !settings.enabled,
-            ..settings
-        });
+        send(
+            host,
+            EqSettings {
+                enabled: !settings.enabled,
+                ..settings
+            },
+        );
     }
     // Winamp's AUTO loaded a preset per song, which ytamp has no
     // equivalent for; here the button lays the bands flat.
@@ -106,10 +109,13 @@ pub(super) fn show(
         )
         .clicked()
     {
-        send(host, EqSettings {
-            gains_db: [0.0; 10],
-            ..settings
-        });
+        send(
+            host,
+            EqSettings {
+                gains_db: [0.0; 10],
+                ..settings
+            },
+        );
     }
     let presets = view.button(
         layout::EQ_PRESETS_BUTTON,
@@ -127,10 +133,13 @@ pub(super) fn show(
                 }
                 let chosen = preset.gains_db == settings.gains_db;
                 if ui.selectable_label(chosen, preset.name).clicked() {
-                    send(host, EqSettings {
-                        gains_db: preset.gains_db,
-                        ..settings
-                    });
+                    send(
+                        host,
+                        EqSettings {
+                            gains_db: preset.gains_db,
+                            ..settings
+                        },
+                    );
                     ui.close();
                 }
             }
@@ -139,17 +148,26 @@ pub(super) fn show(
     graph(view, &settings);
     let preamp = fraction(settings.preamp_db);
     if let Some(value) = slider(view, layout::EQ_PREAMP, "eq-preamp", preamp) {
-        send(host, EqSettings {
-            preamp_db: decibels(value),
-            ..settings
-        });
+        send(
+            host,
+            EqSettings {
+                preamp_db: decibels(value),
+                ..settings
+            },
+        );
     }
     for (band, gain_db) in settings.gains_db.into_iter().enumerate() {
         let area = layout::eq_band(band);
         if let Some(value) = slider(view, area, &format!("eq-band-{band}"), fraction(gain_db)) {
             let mut gains_db = settings.gains_db;
             gains_db[band] = decibels(value);
-            send(host, EqSettings { gains_db, ..settings });
+            send(
+                host,
+                EqSettings {
+                    gains_db,
+                    ..settings
+                },
+            );
         }
     }
 }

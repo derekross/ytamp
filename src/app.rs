@@ -3,9 +3,9 @@
 //! It implements [`WinampHost`], the frozen trait the skin engine draws
 //! against (docs/DESIGN.md).
 //!
-//! Builder C. The `standins` module holds minimal local types for Builder
-//! A (skin engine) and Builder B (YT + audio) so this shell compiles and
-//! runs standalone; each carries an `INTEGRATOR:` swap note.
+//! Integrated: the real implementations from Builders A and B are wired
+//! in below; only the window-position memory (`MiniPos`) and the engine
+//! handle retention are glue added at integration time.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,358 +16,20 @@ use tokio::sync::{broadcast, mpsc};
 use crate::model::{PlaybackState, PlayerCommand, PlayerEvent, SpectrumFrame, Track};
 use crate::settings::{EqSettings, Settings};
 
-// INTEGRATOR: after Builder A's branch lands, replace these re-exports with
-// the real types (keeping the same names everywhere else in this shell):
-//   Skin, SkinError          <- crate::skin
-//   SkinTextures, WinampState, winamp_ui, WinampHost <- crate::ui::winamp
-// INTEGRATOR: after Builder B's branch lands:
-//   PlayerEngine             <- crate::player
-//   YtClient                 <- crate::yt
-pub use standins::{PlayerEngine, Skin, SkinError, WinampHost, WinampState, YtClient, winamp_ui};
+// Real implementations (Builders A and B), per the frozen contracts.
+pub use crate::player::PlayerEngine;
+pub use crate::skin::{Skin, SkinError};
+pub use crate::ui::winamp::winamp_ui;
+pub use crate::winamp::{SkinTextures, WinampHost, WinampState};
+pub use crate::yt::YtClient;
 
 /// How long a toast/banner stays on screen.
 pub const TOAST_LIFETIME: Duration = Duration::from_secs(4);
 
-/// Local stand-ins for Builder A and Builder B types, per docs/DESIGN.md
-/// contracts. Each is the minimum the app shell needs; swap on integration.
-pub mod standins {
-    use std::path::Path;
-
-    use super::*;
-
-    // ------------------------------------------------------------------
-    // Builder A: skin engine (src/skin/*, src/ui/winamp/*)
-    // ------------------------------------------------------------------
-
-    /// The host interface the Winamp UI draws against — exactly the frozen
-    /// trait from docs/DESIGN.md.
-    ///
-    /// INTEGRATOR: delete this stand-in and import the trait from
-    /// `crate::ui::winamp` (Builder A); the `impl WinampHost for YtampApp`
-    /// below keeps working unchanged.
-    pub trait WinampHost {
-        fn cmd(&mut self, c: PlayerCommand);
-        fn state(&self) -> &PlaybackState;
-        fn spectrum(&self) -> SpectrumFrame;
-        fn eq(&self) -> EqSettings;
-        fn load_skin_file(&mut self, path: &Path);
-    }
-
-    /// INTEGRATOR: swap to `crate::skin::Skin` (Builder A).
-    #[derive(Clone, Debug)]
-    pub struct Skin {
-        pub name: String,
-    }
-
-    /// INTEGRATOR: swap to `crate::skin::SkinError` (Builder A).
-    #[derive(Clone, Debug)]
-    pub struct SkinError(pub String);
-
-    impl std::fmt::Display for SkinError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(&self.0)
-        }
-    }
-    impl std::error::Error for SkinError {}
-
-    impl Skin {
-        /// The built-in look, worn when no archive is loaded.
-        pub fn builtin() -> Skin {
-            Skin {
-                name: "built-in".into(),
-            }
-        }
-
-        /// INTEGRATOR: swap to the real parser (zip + BMP sprite sheets).
-        pub fn load(path: &Path) -> Result<Skin, SkinError> {
-            let name = path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "skin".into());
-            let bytes =
-                std::fs::read(path).map_err(|e| SkinError(format!("{}: {e}", path.display())))?;
-            Self::from_archive(&name, &bytes)
-        }
-
-        /// INTEGRATOR: swap to the real parser.
-        pub fn from_archive(name: &str, bytes: &[u8]) -> Result<Skin, SkinError> {
-            if bytes.len() < 4 || &bytes[..2] != b"PK" {
-                return Err(SkinError("not a zip archive (.wsz)".into()));
-            }
-            Ok(Skin {
-                name: super::skin_display_label(name).to_string(),
-            })
-        }
-    }
-
-    /// INTEGRATOR: swap to Builder A's texture cache (sprite sheets turned
-    /// into egui handles).
-    #[derive(Default)]
-    pub struct SkinTextures;
-
-    /// Mini player state: scale, toggles, remembered window position.
-    ///
-    /// INTEGRATOR: swap to Builder A's Winamp state type
-    /// (`crate::winamp::WinampState` or `ui::winamp`'s). `wants_exit` is
-    /// stand-in only (their eject-button path replaces it).
-    #[derive(Clone, Debug)]
-    pub struct WinampState {
-        pub scale: u8,
-        pub time_remaining: bool,
-        pub restore_pos: Option<[f32; 2]>,
-        pub last_pos: Option<[f32; 2]>,
-        /// Stand-in only: the ✕ button asked to leave mini mode.
-        pub wants_exit: bool,
-        /// Stand-in only: the EQ button asked to flip the EQ panel.
-        pub wants_eq: bool,
-        /// Stand-in only: whether the EQ panel is open (mirrors the app's
-        /// `eq_open`, decided here so the shell stays out of the draw).
-        pub eq_open: bool,
-        /// Stand-in only: the EQ sliders' working copy; each twist goes to
-        /// the engine through `SetEq` and comes back via the echo channel.
-        pub eq_scratch: EqSettings,
-    }
-
-    impl Default for WinampState {
-        fn default() -> Self {
-            Self {
-                scale: 2,
-                time_remaining: false,
-                restore_pos: None,
-                last_pos: None,
-                wants_exit: false,
-                wants_eq: false,
-                eq_open: false,
-                eq_scratch: EqSettings::default(),
-            }
-        }
-    }
-
-    impl WinampState {
-        /// Where the window last was, if it ever told us.
-        pub fn remember_position(&mut self) {
-            if let Some(pos) = self.last_pos {
-                self.restore_pos = Some(pos);
-            }
-        }
-
-        /// The main window is classically 275x116 skin pixels.
-        pub fn window_size(&self) -> egui::Vec2 {
-            egui::vec2(275.0, 116.0) * self.scale as f32
-        }
-    }
-
-    /// Renders the whole mini-player window.
-    ///
-    /// INTEGRATOR: swap to `crate::ui::winamp::winamp_ui` (Builder A) —
-    /// same signature as docs/DESIGN.md.
-    pub fn winamp_ui(
-        ui: &mut egui::Ui,
-        state: &mut WinampState,
-        skin: &Skin,
-        host: &mut dyn WinampHost,
-        tex: &mut SkinTextures,
-    ) {
-        let _ = tex;
-        mini_player::draw(ui, state, skin, host);
-    }
-
-    pub mod mini_player;
-
-    // ------------------------------------------------------------------
-    // Builder B: player engine (src/player.rs, src/audio/*)
-    // ------------------------------------------------------------------
-
-    /// Offline player engine: drains commands, keeps a local
-    /// [`PlaybackState`], ticks position while "playing", and broadcasts
-    /// state + an animated fake spectrum so the UI is demoable standalone.
-    ///
-    /// INTEGRATOR: swap to `crate::player::PlayerEngine::spawn` (Builder B).
-    /// DESIGN.md freezes the two-argument shape; if their spawn grows an
-    /// audio-output argument, adjust only the call site in `YtampApp::new`.
-    pub struct PlayerEngine;
-
-    impl PlayerEngine {
-        pub fn spawn(
-            commands: mpsc::Receiver<PlayerCommand>,
-            events: broadcast::Sender<PlayerEvent>,
-        ) -> anyhow::Result<Self> {
-            std::thread::Builder::new()
-                .name("player-engine-standin".into())
-                .spawn(move || engine_loop(commands, events))
-                .map_err(|e| anyhow::anyhow!("engine thread: {e}"))?;
-            Ok(Self)
-        }
-    }
-
-    fn engine_loop(
-        mut commands: mpsc::Receiver<PlayerCommand>,
-        events: broadcast::Sender<PlayerEvent>,
-    ) {
-        let mut state = PlaybackState::default();
-        let info = PlayerEvent::Info(
-            "Audio engine offline (stand-in): playback is simulated until the real engine lands."
-                .into(),
-        );
-        let _ = events.send(info);
-        let _ = events.send(PlayerEvent::State(state.clone()));
-
-        let mut last_tick = Instant::now();
-        let mut last_state: Option<Instant> = None;
-        let mut last_spectrum: Option<Instant> = None;
-        loop {
-            // A batch of commands, then the clock.
-            let mut commands_seen = false;
-            while let Ok(command) = commands.try_recv() {
-                commands_seen = true;
-                apply_command(&mut state, &command);
-            }
-            if commands.is_closed() {
-                break; // app went away
-            }
-            let elapsed = last_tick.elapsed().as_secs_f64();
-            last_tick = Instant::now();
-            if state.playing {
-                state.position_secs += elapsed;
-                if let Some(duration) = state.duration_secs
-                    && state.position_secs >= duration
-                {
-                    state.position_secs = duration;
-                    state.playing = false;
-                }
-            }
-
-            let now = Instant::now();
-            let playing = state.playing;
-            if commands_seen
-                || (playing && last_state.is_none_or(|t| now - t >= Duration::from_millis(250)))
-            {
-                last_state = Some(now);
-                let _ = events.send(PlayerEvent::State(state.clone()));
-            }
-            if playing && last_spectrum.is_none_or(|t| now - t >= Duration::from_millis(66)) {
-                last_spectrum = Some(now);
-                let t = now.elapsed().as_secs_f64();
-                let _ = events.send(PlayerEvent::Spectrum(fake_spectrum(t)));
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
-    }
-
-    fn apply_command(state: &mut PlaybackState, command: &PlayerCommand) {
-        let play_index = |state: &mut PlaybackState, index: usize| {
-            if let Some(track) = state.queue.get(index).cloned() {
-                state.queue_index = Some(index);
-                state.track = Some(track.clone());
-                state.position_secs = 0.0;
-                state.duration_secs = track.duration_secs.map(|duration| duration as f64);
-                state.playing = true;
-            }
-        };
-        match command {
-            PlayerCommand::PlayAt(i) => play_index(state, *i),
-            PlayerCommand::QueueReplace(tracks, start) => {
-                state.queue = tracks.clone();
-                match start {
-                    Some(i) => play_index(state, *i),
-                    None => {
-                        state.queue_index = None;
-                        state.track = None;
-                        state.playing = false;
-                        state.position_secs = 0.0;
-                        state.duration_secs = None;
-                    }
-                }
-            }
-            PlayerCommand::QueueAppend(tracks) => state.queue.extend(tracks.iter().cloned()),
-            PlayerCommand::Next => {
-                if let Some(i) = state.queue_index
-                    && i + 1 < state.queue.len()
-                {
-                    play_index(state, i + 1);
-                } else {
-                    state.playing = false;
-                }
-            }
-            PlayerCommand::Prev => {
-                if state.position_secs > 3.0 {
-                    state.position_secs = 0.0;
-                } else if let Some(i) = state.queue_index.and_then(|i| i.checked_sub(1)) {
-                    play_index(state, i);
-                } else {
-                    state.position_secs = 0.0;
-                }
-            }
-            PlayerCommand::PlayPause => {
-                if state.playing {
-                    state.playing = false;
-                } else if state.queue_index.is_some() {
-                    state.playing = true;
-                }
-            }
-            PlayerCommand::Pause => state.playing = false,
-            PlayerCommand::Resume => {
-                if state.queue_index.is_some() {
-                    state.playing = true;
-                }
-            }
-            PlayerCommand::Stop => {
-                state.playing = false;
-                state.position_secs = 0.0;
-            }
-            PlayerCommand::SeekRatio(ratio) => {
-                if let Some(duration) = state.duration_secs {
-                    state.position_secs = (ratio.clamp(0.0, 1.0) * duration).min(duration);
-                }
-            }
-            PlayerCommand::SetVolume(volume) => state.volume = volume.clamp(0.0, 1.0),
-            PlayerCommand::SetEq { .. } => {} // the UI owns the echo of this
-        }
-    }
-
-    /// A gentle animated stand-in for the analyser tap.
-    fn fake_spectrum(t: f64) -> SpectrumFrame {
-        let bands = (0..20)
-            .map(|i| {
-                let f = i as f64;
-                let pulse = 0.55 + 0.45 * (t * 1.7).sin();
-                let wave = 0.5 + 0.5 * (t * (2.0 + f * 0.31) + f * 1.3).sin();
-                let tilt = 1.0 - (f / 22.0) * 0.55;
-                (pulse * wave * tilt).clamp(0.0, 1.0) as f32
-            })
-            .collect();
-        SpectrumFrame { bands }
-    }
-
-    // ------------------------------------------------------------------
-    // Builder B: YouTube Music client (src/yt/*)
-    // ------------------------------------------------------------------
-
-    /// Canned-results client so the search UI is demoable offline.
-    ///
-    /// INTEGRATOR: swap to `crate::yt::YtClient` (Builder B). The app keeps
-    /// it behind an `Arc`, so it does not need to be `Clone`.
-    #[derive(Clone, Default)]
-    pub struct YtClient {
-        #[allow(dead_code)] // real client: reqwest + cookies
-        cookies: Option<String>,
-    }
-
-    impl YtClient {
-        pub fn new(cookies: Option<String>) -> Self {
-            Self { cookies }
-        }
-
-        pub async fn search_tracks(&self, q: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
-            Ok((0..limit).map(|i| canned_track(q, i)).collect())
-        }
-
-        pub async fn radio_for(&self, video_id: &str, limit: usize) -> anyhow::Result<Vec<Track>> {
-            Ok((0..limit)
-                .map(|i| canned_track(&format!("radio:{video_id}"), i + 100))
-                .collect())
-        }
-    }
+/// Test-only canned tracks (deterministic, YouTube-shaped ids).
+#[cfg(test)]
+pub mod canned {
+    use crate::model::Track;
 
     const CANNED_ARTISTS: [&str; 8] = [
         "Autechre",
@@ -380,7 +42,7 @@ pub mod standins {
         "Four Tet",
     ];
 
-    /// Deterministic stand-in track from a seed. Public for tests.
+    /// Deterministic canned track from a seed.
     pub fn canned_track(seed: &str, i: usize) -> Track {
         Track {
             video_id: canned_video_id(seed, i),
@@ -413,6 +75,13 @@ pub mod standins {
             })
             .collect()
     }
+}
+
+/// The `m:ss` clock readout, the Winamp way (used by the main window
+/// surfaces; the skinned mini player draws its own pixel clock).
+pub fn fmt_time(secs: f64) -> String {
+    let secs = secs.max(0.0) as u64;
+    format!("{}:{:02}", secs / 60, secs % 60)
 }
 
 /// A skin file name without its archive extension, for showing.
@@ -526,18 +195,29 @@ pub struct SearchState {
 }
 
 /// Skin + mini player state behind the Winamp window.
+#[derive(Default)]
 pub struct MiniState {
-    pub skin: Option<Skin>,
+    pub skin: Option<Arc<Skin>>,
     pub winamp: WinampState,
-    pub textures: standins::SkinTextures,
+    pub textures: SkinTextures,
+    /// Where the mini window was when it last closed (integration glue:
+    /// the skinned UI owns no window position).
+    pub pos: MiniPos,
 }
 
-impl Default for MiniState {
-    fn default() -> Self {
-        Self {
-            skin: None,
-            winamp: WinampState::default(),
-            textures: standins::SkinTextures,
+/// The mini window's position memory: where it is now, and where it
+/// should come back next time it opens.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MiniPos {
+    pub last: Option<[f32; 2]>,
+    pub restore: Option<[f32; 2]>,
+}
+
+impl MiniPos {
+    /// The last known position becomes the one to restore to.
+    pub fn remember(&mut self) {
+        if let Some(pos) = self.last {
+            self.restore = Some(pos);
         }
     }
 }
@@ -575,6 +255,10 @@ pub struct YtampApp {
     /// Commands to the player engine; `None` when the engine is gone.
     pub cmd_tx: Option<mpsc::Sender<PlayerCommand>>,
     events: Option<broadcast::Receiver<PlayerEvent>>,
+    /// The engine itself: kept alive for the app's lifetime (its Drop is
+    /// the engine's kill switch).
+    #[allow(dead_code)] // retention is the point; it is never read back
+    engine_handle: Option<PlayerEngine>,
     /// Latest engine snapshots.
     pub state: PlaybackState,
     pub spectrum: SpectrumFrame,
@@ -611,6 +295,15 @@ pub struct YtampApp {
     /// Echoes from the mini player's host view (volume/EQ turns).
     echo_tx: std::sync::mpsc::Sender<HostEcho>,
     echo_rx: std::sync::mpsc::Receiver<HostEcho>,
+    /// Set by the skinned UI's eject button (via `WinampHost::leave_mini_player`);
+    /// the frame folds it into a mode switch after the draw.
+    leave_mini_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the skinned UI's EQ toggle (via `WinampHost::toggle_eq_window`).
+    eq_toggle_requested: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the skinned UI's playlist toggle (via
+    /// `WinampHost::toggle_playlist_window`); folds into `mini.winamp`
+    /// after the draw.
+    playlist_toggle_requested: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl YtampApp {
@@ -626,17 +319,20 @@ impl YtampApp {
             .enable_all()
             .build()?;
 
-        // Player engine, DESIGN.md contract shape.
+        // Player engine, DESIGN.md contract shape. The handle is kept:
+        // dropping it would stop the engine (its Drop is the kill switch).
         let (cmd_tx, cmd_rx) = mpsc::channel(128);
         let (event_tx, _) = broadcast::channel(512);
         let engine_note;
         let mut events = None;
         let mut cmd_handle = None;
+        let mut engine_handle = None;
         match PlayerEngine::spawn(cmd_rx, event_tx.clone()) {
-            Ok(_engine) => {
+            Ok(engine) => {
+                engine_handle = Some(engine);
                 events = Some(event_tx.subscribe());
                 cmd_handle = Some(cmd_tx.clone());
-                engine_note = Some("offline (stand-in engine)".to_string());
+                engine_note = None;
             }
             Err(error) => {
                 log::error!("player engine failed to spawn: {error}");
@@ -661,9 +357,12 @@ impl YtampApp {
 
         let mut app = Self {
             mini: MiniState {
-                winamp: WinampState {
-                    scale: settings.skin_scale.clamp(1, 4),
-                    ..WinampState::default()
+                winamp: {
+                    // Struct-literal spread would fail: the marquee fields
+                    // are private. Set the public scale after the default.
+                    let mut winamp = WinampState::default();
+                    winamp.scale = u32::from(settings.skin_scale.clamp(1, 4));
+                    winamp
                 },
                 ..MiniState::default()
             },
@@ -673,6 +372,7 @@ impl YtampApp {
             last_settings_save: None,
             cmd_tx: cmd_handle,
             events,
+            engine_handle,
             state: PlaybackState::default(),
             spectrum: SpectrumFrame::default(),
             engine_note,
@@ -693,6 +393,9 @@ impl YtampApp {
             window_title: "ytamp".into(),
             echo_tx,
             echo_rx,
+            leave_mini_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            eq_toggle_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            playlist_toggle_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         app.state.volume = app.settings.volume;
 
@@ -720,7 +423,7 @@ impl YtampApp {
             // state and put the window back where it was.
             ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
-            if let Some([x, y]) = self.mini.winamp.restore_pos {
+            if let Some([x, y]) = self.mini.pos.restore {
                 ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(egui::pos2(x, y)));
             }
         }
@@ -780,7 +483,7 @@ impl YtampApp {
     /// recreates the window; the caller sends the Close viewport command.
     pub fn toggle_mini(&mut self) {
         if self.settings.winamp_window {
-            self.mini.winamp.remember_position();
+            self.mini.pos.remember();
         }
         self.settings.winamp_window = !self.settings.winamp_window;
         self.mark_dirty();
@@ -800,13 +503,12 @@ impl YtampApp {
             return;
         };
         let dest = self.skins_dir.join(&name);
-        if dest != path {
-            if let Err(error) =
+        if dest != path
+            && let Err(error) =
                 std::fs::create_dir_all(&self.skins_dir).and_then(|()| std::fs::copy(path, &dest))
-            {
-                self.toast_error(format!("could not copy skin into library: {error}"));
-                return;
-            }
+        {
+            self.toast_error(format!("could not copy skin into library: {error}"));
+            return;
         }
         self.load_skin_by_name(&name);
     }
@@ -816,10 +518,10 @@ impl YtampApp {
         let path = self.skins_dir.join(name);
         match Skin::load(&path) {
             Ok(skin) => {
-                self.mini.skin = Some(skin.clone());
+                self.toast(format!("Skin: {}", skin.name));
+                self.mini.skin = Some(Arc::new(skin));
                 self.settings.skin = Some(name.to_string());
                 self.mark_dirty();
-                self.toast(format!("Skin: {}", skin.name));
             }
             Err(error) => self.toast_error(format!("skin {name}: {error}")),
         }
@@ -846,7 +548,7 @@ impl YtampApp {
                 Some((name, path))
             })
             .collect();
-        skins.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        skins.sort_by_key(|a| a.0.to_lowercase());
         skins
     }
 
@@ -978,6 +680,9 @@ impl YtampApp {
             eq: self.settings.eq,
             skin_requests: self.skin_request_tx.clone(),
             echoes: Some(self.echo_tx.clone()),
+            leave_mini: Some(self.leave_mini_requested.clone()),
+            toggle_eq: Some(self.eq_toggle_requested.clone()),
+            toggle_playlist: Some(self.playlist_toggle_requested.clone()),
         }
     }
 
@@ -1124,20 +829,22 @@ impl YtampApp {
     }
 
     /// The mini player's frame: remember where the window is, fit it to
-    /// its wanted size, draw through the stand-in renderer, then fold its
-    /// deferred intents back into the app.
+    /// its wanted size, draw through the skinned renderer, then fold the
+    /// host's deferred intents back into the app.
     fn frame_mini(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         if let Some(rect) = ctx.input(|input| input.viewport().outer_rect) {
-            self.mini.winamp.last_pos = Some([rect.min.x, rect.min.y]);
+            self.mini.pos.last = Some([rect.min.x, rect.min.y]);
         }
+        // The app owns which side windows are open; the skinned state is
+        // kept in step before the draw.
         self.mini.winamp.eq_open = self.eq_open;
-        self.mini.winamp.eq_scratch = self.settings.eq;
-        let wanted = standins::mini_player::desired_window_size(&self.mini.winamp);
+        let wanted = crate::ui::winamp::window_size(&self.mini.winamp);
         fit_mini_window(&ctx, wanted);
 
+        // The skinless look is the engine's generated built-in skin.
         let builtin;
-        let skin = match &self.mini.skin {
+        let skin: &Skin = match &self.mini.skin {
             Some(skin) => skin,
             None => {
                 builtin = Skin::builtin();
@@ -1153,19 +860,24 @@ impl YtampApp {
             &mut self.mini.textures,
         );
 
-        if self.mini.winamp.wants_exit {
-            self.mini.winamp.wants_exit = false;
+        use std::sync::atomic::Ordering;
+        if self.leave_mini_requested.swap(false, Ordering::Relaxed) {
             self.toggle_mini();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if self.mini.winamp.wants_eq {
-            self.mini.winamp.wants_eq = false;
+        if self.eq_toggle_requested.swap(false, Ordering::Relaxed) {
             self.eq_open = !self.eq_open;
         }
+        if self
+            .playlist_toggle_requested
+            .swap(false, Ordering::Relaxed)
+        {
+            self.mini.winamp.playlist_open = !self.mini.winamp.playlist_open;
+        }
         let scale = self.mini.winamp.scale.clamp(1, 4);
-        if scale != self.settings.skin_scale {
+        if scale != u32::from(self.settings.skin_scale) {
             self.mini.winamp.scale = scale;
-            self.settings.skin_scale = scale;
+            self.settings.skin_scale = scale as u8;
             self.mark_dirty();
         }
     }
@@ -1295,6 +1007,19 @@ impl WinampHost for YtampApp {
     fn load_skin_file(&mut self, path: &Path) {
         self.install_skin(path);
     }
+
+    fn toggle_eq_window(&mut self) {
+        self.eq_open = !self.eq_open;
+    }
+
+    fn toggle_playlist_window(&mut self) {
+        self.mini.winamp.playlist_open = !self.mini.winamp.playlist_open;
+    }
+
+    fn leave_mini_player(&mut self) {
+        // The eject button leaves the mini player.
+        self.toggle_mini();
+    }
 }
 
 /// What the mini player changed through its host view this frame; the
@@ -1313,6 +1038,11 @@ pub struct HostView {
     eq: EqSettings,
     skin_requests: std::sync::mpsc::Sender<PathBuf>,
     echoes: Option<std::sync::mpsc::Sender<HostEcho>>,
+    /// Deferred intents the app folds in after the draw (borrows force it:
+    /// `winamp_ui` holds `&mut mini.winamp` while the host runs).
+    leave_mini: Option<Arc<std::sync::atomic::AtomicBool>>,
+    toggle_eq: Option<Arc<std::sync::atomic::AtomicBool>>,
+    toggle_playlist: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl WinampHost for HostView {
@@ -1357,6 +1087,24 @@ impl WinampHost for HostView {
 
     fn load_skin_file(&mut self, path: &Path) {
         let _ = self.skin_requests.send(path.to_path_buf());
+    }
+
+    fn toggle_eq_window(&mut self) {
+        if let Some(flag) = &self.toggle_eq {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn toggle_playlist_window(&mut self) {
+        if let Some(flag) = &self.toggle_playlist {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn leave_mini_player(&mut self) {
+        if let Some(flag) = &self.leave_mini {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -1449,57 +1197,6 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_simulates_a_queue() {
-        let (cmd_tx, cmd_rx) = mpsc::channel(16);
-        let (event_tx, mut event_rx) = broadcast::channel(64);
-        PlayerEngine::spawn(cmd_rx, event_tx).unwrap();
-
-        let first = standins::canned_track("sim", 0);
-        cmd_tx
-            .try_send(PlayerCommand::QueueReplace(
-                vec![first.clone(), standins::canned_track("sim", 1)],
-                Some(0),
-            ))
-            .unwrap();
-
-        let mut playing_state = None;
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < deadline {
-            if let Ok(PlayerEvent::State(state)) = event_rx.try_recv()
-                && state.playing
-                && state.track.is_some()
-            {
-                playing_state = Some(state);
-                break;
-            } else {
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-        let state = playing_state.expect("engine reported playing state");
-        assert_eq!(state.track.as_ref().unwrap().video_id, first.video_id);
-        assert_eq!(state.queue.len(), 2);
-        assert_eq!(state.queue_index, Some(0));
-    }
-
-    #[test]
-    fn canned_search_and_radio_are_deterministic_and_distinct() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let yt = YtClient::new(None);
-        let a = rt.block_on(yt.search_tracks("lofi", 5)).unwrap();
-        let b = rt.block_on(yt.search_tracks("lofi", 5)).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 5);
-        assert!(a.iter().all(|t| t.video_id.len() == 11));
-
-        let radio = rt.block_on(yt.radio_for(&a[0].video_id, 20)).unwrap();
-        assert_eq!(radio.len(), 20);
-        assert!(radio.iter().all(|t| t.video_id != a[0].video_id));
-    }
-
-    #[test]
     fn installing_a_skin_copies_it_into_the_library_and_selects_it() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = YtampApp::new(
@@ -1509,8 +1206,11 @@ mod tests {
         )
         .unwrap();
 
+        // A real skin from the skin engine's testdata; renamed to prove the
+        // file name, not the skin's contents, drives the library entry.
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/base-2.91.wsz");
         let source = dir.path().join("My-Skin.wsz");
-        std::fs::write(&source, b"PK\x03\x04 fake zip bytes").unwrap();
+        std::fs::copy(&fixture, &source).unwrap();
 
         app.install_skin(&source);
         assert!(app.mini.skin.is_some());
@@ -1530,7 +1230,7 @@ mod tests {
     #[test]
     fn radio_outcomes_append_only_fresh_tracks_end_to_end() {
         let (_dir, mut app) = test_app();
-        let seed: Vec<Track> = (0..3).map(|i| standins::canned_track("q", i)).collect();
+        let seed: Vec<Track> = (0..3).map(|i| canned::canned_track("q", i)).collect();
         app.search.results = seed.clone();
         app.play_result(0);
         // QueueReplace went out; drain the engine echo to see it.
@@ -1546,7 +1246,7 @@ mod tests {
 
         // Radio arrives: the three known ids must not be re-appended.
         let mut radio: Vec<Track> = seed.clone();
-        radio.push(standins::canned_track("radio:x", 0));
+        radio.push(canned::canned_track("radio:x", 0));
         let video_id = seed[0].video_id.clone();
         app.apply_search_outcome(SearchOutcome::Radio {
             video_id,

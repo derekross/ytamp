@@ -50,8 +50,8 @@ struct MiniWindow {
 impl MiniWindow {
     fn wanted(app: &YtampApp) -> Option<Self> {
         app.settings.winamp_window.then(|| Self {
-            size: app.mini.winamp.window_size(),
-            position: app.mini.winamp.restore_pos,
+            size: ytamp::ui::winamp::window_size(&app.mini.winamp),
+            position: app.mini.pos.restore,
             storage_path: settings::cache_dir().join("winamp.ron"),
         })
     }

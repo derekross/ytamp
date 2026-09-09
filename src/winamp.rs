@@ -191,18 +191,10 @@ impl WinampState {
 
 /// The skin's sheets as egui textures, made on demand and remade whenever
 /// the skin under them changes (its id does).
+#[derive(Default)]
 pub struct SkinTextures {
     skin_id: u64,
     handles: HashMap<Sheet, egui::TextureHandle>,
-}
-
-impl Default for SkinTextures {
-    fn default() -> Self {
-        Self {
-            skin_id: 0,
-            handles: HashMap::new(),
-        }
-    }
 }
 
 impl SkinTextures {
@@ -293,7 +285,10 @@ mod tests {
         assert_eq!(state.stack_height(), layout::SHADE_HEIGHT);
         state.shaded = false;
         state.eq_open = true;
-        assert_eq!(state.stack_height(), layout::WINDOW_HEIGHT + layout::EQ_HEIGHT);
+        assert_eq!(
+            state.stack_height(),
+            layout::WINDOW_HEIGHT + layout::EQ_HEIGHT
+        );
         state.eq_shaded = true;
         assert_eq!(
             state.stack_height(),

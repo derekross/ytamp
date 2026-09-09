@@ -39,10 +39,7 @@ pub(crate) enum SliderEvent {
 
 /// The stack's height in logical points: the window's size at this scale.
 pub fn window_size(state: &WinampState) -> egui::Vec2 {
-    vec2(
-        layout::WINDOW_WIDTH as f32,
-        state.stack_height() as f32,
-    ) * state.scale as f32
+    vec2(layout::WINDOW_WIDTH as f32, state.stack_height() as f32) * state.scale as f32
 }
 
 /// Draws the skin's sprites into the window and reads the pointer against
@@ -620,7 +617,12 @@ fn clutter_bar(view: &mut View, state: &mut WinampState, host: &mut dyn WinampHo
     // O opened Winamp's options menu; here it leaves for the big window,
     // where the settings live.
     if view
-        .lamp_button(layout::CLUTTER_O, sprites::CLUTTER_O_LIT, false, "clutter-o")
+        .lamp_button(
+            layout::CLUTTER_O,
+            sprites::CLUTTER_O_LIT,
+            false,
+            "clutter-o",
+        )
         .on_hover_text("Options (in the big window)")
         .clicked()
     {
@@ -628,11 +630,21 @@ fn clutter_bar(view: &mut View, state: &mut WinampState, host: &mut dyn WinampHo
     }
     // A was "always on top"; the host owns window level, so the lamp is
     // decorative until the host wires it.
-    view.lamp_button(layout::CLUTTER_A, sprites::CLUTTER_A_LIT, false, "clutter-a");
+    view.lamp_button(
+        layout::CLUTTER_A,
+        sprites::CLUTTER_A_LIT,
+        false,
+        "clutter-a",
+    );
     // I showed the song's info; the big window's now-playing panel is
     // that.
     if view
-        .lamp_button(layout::CLUTTER_I, sprites::CLUTTER_I_LIT, false, "clutter-i")
+        .lamp_button(
+            layout::CLUTTER_I,
+            sprites::CLUTTER_I_LIT,
+            false,
+            "clutter-i",
+        )
         .on_hover_text("Song info (in the big window)")
         .clicked()
     {
@@ -659,7 +671,12 @@ fn clutter_bar(view: &mut View, state: &mut WinampState, host: &mut dyn WinampHo
     }
     // V opened Winamp's visualisation menu; a click on the display itself
     // cycles it, so the lamp only lights.
-    view.lamp_button(layout::CLUTTER_V, sprites::CLUTTER_V_LIT, false, "clutter-v");
+    view.lamp_button(
+        layout::CLUTTER_V,
+        sprites::CLUTTER_V_LIT,
+        false,
+        "clutter-v",
+    );
 }
 
 /// The display's left box: the spectrum analyser in the skin's own
@@ -699,7 +716,13 @@ fn visualiser(view: &mut View, state: &mut WinampState, host: &mut dyn WinampHos
     for (index, bar) in bars.iter().enumerate() {
         let x = area.x + 4 * index as u32;
         for row in (vis::ROWS - bar.height)..vis::ROWS {
-            view.fill(x, area.y + u32::from(row), 3, 1, color(2 + usize::from(row)));
+            view.fill(
+                x,
+                area.y + u32::from(row),
+                3,
+                1,
+                color(2 + usize::from(row)),
+            );
         }
         if let Some(peak) = bar.peak {
             let row = vis::ROWS - peak;
@@ -1225,7 +1248,10 @@ mod tests {
             marquee_text(&playing, None, None, None),
             "Radiohead — Karma Police (4:24)"
         );
-        assert_eq!(marquee_text(&PlaybackState::default(), None, None, None), "ytamp");
+        assert_eq!(
+            marquee_text(&PlaybackState::default(), None, None, None),
+            "ytamp"
+        );
         let untitled = playback("Episode 12", "", 0.0);
         assert_eq!(marquee_text(&untitled, None, None, None), "Episode 12");
     }
@@ -1242,7 +1268,10 @@ mod tests {
     #[test]
     fn sliders_announce_themselves_while_they_move() {
         let playing = playback("Karma Police", "Radiohead", 264.0);
-        assert_eq!(marquee_text(&playing, None, Some(0.57), None), "Volume: 57%");
+        assert_eq!(
+            marquee_text(&playing, None, Some(0.57), None),
+            "Volume: 57%"
+        );
         assert_eq!(
             marquee_text(&playing, None, None, Some(-0.25)),
             "Balance: 25% left"

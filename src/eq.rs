@@ -32,7 +32,7 @@ const SOLVED_LIMIT: f64 = 36.0;
 ///
 /// This is the shape shared across the UI, [`crate::winamp::WinampHost`],
 /// and the player's audio pipeline; gains are decibels within ±[`RANGE_DB`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct EqSettings {
     pub enabled: bool,
     /// Twelve decibels either way, like the preamp.
