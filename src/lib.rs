@@ -12,4 +12,4 @@ pub mod vis;
 pub mod winamp;
 pub mod yt;
 
-pub use model::{PlayerCommand, PlayerEvent, PlaybackState, SpectrumFrame, Track};
+pub use model::{PlaybackState, PlayerCommand, PlayerEvent, SpectrumFrame, Track};

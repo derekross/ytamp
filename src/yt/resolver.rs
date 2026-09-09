@@ -1,13 +1,12 @@
 //! Stream URL resolution: InnerTube `player` client chain → AAC itag
 //! selection → small TTL cache → yt-dlp escape hatch (DESIGN.md).
 
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use serde_json::Value;
 
-use crate::yt::innertube::{client_chain, ClientCtx, YtClient};
+use crate::yt::innertube::{ClientCtx, YtClient, client_chain};
 
 /// A resolved, directly fetchable audio stream (DESIGN.md contract).
 #[derive(Clone, Debug)]
@@ -20,7 +19,7 @@ pub struct StreamUrl {
 
 /// One candidate format after filtering, for internal selection ranking.
 #[derive(Clone, Debug)]
-struct Candidate {
+pub(crate) struct Candidate {
     url: String,
     itag: u32,
     mime: String,
@@ -77,7 +76,7 @@ pub(crate) fn pick_audio_format(resp: &Value) -> Option<Candidate> {
     if candidates.is_empty() {
         return None;
     }
-    candidates.sort_by(|a, b| b.bitrate.cmp(&a.bitrate));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.bitrate));
     candidates
         .iter()
         .position(|c| PREFERRED_ITAGS.contains(&c.itag))
@@ -98,7 +97,7 @@ fn cache_key(client: &ClientCtx, video_id: &str) -> String {
 /// TTL of a URL derived from its `expire=` parameter, clamped to `CACHE_TTL`.
 fn url_ttl(url: &str) -> Duration {
     let expire = url
-        .split('&')
+        .split(['&', '?'])
         .find_map(|p| p.strip_prefix("expire="))
         .and_then(|v| v.parse::<u64>().ok());
     let now = std::time::SystemTime::now()
@@ -180,7 +179,7 @@ pub async fn resolve_stream(client: &YtClient, video_id: &str) -> Result<StreamU
                     )),
                 }
             }
-            Err(e) => attempts.push(format!("{ctx.key}: {e:#}")),
+            Err(e) => attempts.push(format!("{}: {e:#}", ctx.key)),
         }
     }
 
@@ -226,8 +225,8 @@ async fn yt_dlp_fallback(video_id: &str) -> Result<StreamUrl> {
             stderr.lines().last().unwrap_or("(no output)")
         ));
     }
-    let info: Value = serde_json::from_slice(&output.stdout)
-        .context("yt-dlp output was not valid JSON")?;
+    let info: Value =
+        serde_json::from_slice(&output.stdout).context("yt-dlp output was not valid JSON")?;
     let url = info
         .get("url")
         .and_then(Value::as_str)
@@ -239,7 +238,10 @@ async fn yt_dlp_fallback(video_id: &str) -> Result<StreamUrl> {
         .and_then(Value::as_str)
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0);
-    let mime = format!("audio/{}", info.get("ext").and_then(Value::as_str).unwrap_or("mp4"));
+    let mime = format!(
+        "audio/{}",
+        info.get("ext").and_then(Value::as_str).unwrap_or("mp4")
+    );
     let duration_secs = info
         .get("duration")
         .and_then(Value::as_f64)
@@ -281,7 +283,15 @@ mod tests {
             .unwrap()
             .as_array_mut()
             .unwrap();
-        let mut premium = formats[1].clone(); // copy of itag 140
+        // Clone the real itag-140 AUDIO entry and promote it to 141 (the
+        // array mixes video and audio formats — index alone can't be
+        // trusted to be the audio one).
+        let audio140 = formats
+            .iter()
+            .find(|f| f.get("itag").and_then(Value::as_u64) == Some(140))
+            .cloned()
+            .expect("fixture has an itag-140 audio format");
+        let mut premium = audio140;
         premium["itag"] = json!(141);
         premium["bitrate"] = json!(265000);
         formats.push(premium);

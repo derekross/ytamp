@@ -8,8 +8,8 @@
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{anyhow, Context as _, Result};
-use serde_json::{json, Value};
+use anyhow::{Context as _, Result, anyhow};
+use serde_json::{Value, json};
 
 use crate::model::Track;
 use crate::yt::resolver::StreamUrl;
@@ -30,8 +30,10 @@ pub(crate) struct ClientCtx {
     pub id: u32,
     /// `User-Agent` header.
     pub ua: &'static str,
-    /// Extra `context.client` fields (device identity for mobile clients).
-    pub device: Option<Value>,
+    /// Extra `context.client` fields (device identity for mobile clients),
+    /// as a JSON object literal. A string because `serde_json::Value` cannot
+    /// be built in a `const` — parsed once per request in `context_for`.
+    pub device_json: &'static str,
     /// True for music.youtube.com clients (WEB_REMIX).
     pub music: bool,
     /// This client is only tried when cookies are present.
@@ -47,7 +49,7 @@ const WEB_MUSIC: ClientCtx = ClientCtx {
     version: "1.20260114.03.00",
     id: 67,
     ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36,gzip(gfe)",
-    device: None,
+    device_json: "",
     music: true,
     needs_cookies: true,
 };
@@ -60,13 +62,7 @@ const ANDROID_VR: ClientCtx = ClientCtx {
     version: "1.65.10",
     id: 28,
     ua: "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-    device: Some(json!({
-        "deviceMake": "Oculus",
-        "deviceModel": "Quest 3",
-        "androidSdkVersion": 32,
-        "osName": "Android",
-        "osVersion": "12L",
-    })),
+    device_json: r#"{"deviceMake":"Oculus","deviceModel":"Quest 3","androidSdkVersion":32,"osName":"Android","osVersion":"12L"}"#,
     music: false,
     needs_cookies: false,
 };
@@ -80,12 +76,7 @@ const IOS: ClientCtx = ClientCtx {
     version: "21.02.3",
     id: 5,
     ua: "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-    device: Some(json!({
-        "deviceMake": "Apple",
-        "deviceModel": "iPhone16,2",
-        "osName": "iPhone",
-        "osVersion": "18.3.2.22D82",
-    })),
+    device_json: r#"{"deviceMake":"Apple","deviceModel":"iPhone16,2","osName":"iPhone","osVersion":"18.3.2.22D82"}"#,
     music: false,
     needs_cookies: false,
 };
@@ -98,22 +89,23 @@ const TV: ClientCtx = ClientCtx {
     version: "7.20260114.12.00",
     id: 7,
     ua: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
-    device: None,
+    device_json: "",
     music: false,
     needs_cookies: false,
 };
 
-/// Player-request client chain order (DESIGN.md): cookies unlock
+/// Player-request clients in chain order (DESIGN.md): cookies unlock
 /// `web_music` first, then anonymous mobile/TV clients.
+const PLAYER_CLIENTS: [&ClientCtx; 4] = [&WEB_MUSIC, &ANDROID_VR, &IOS, &TV];
+
+/// The chain for a session: every client when cookies are present, only the
+/// anonymous-capable ones otherwise (`needs_cookies` marks the difference).
 pub(crate) fn client_chain(has_cookies: bool) -> Vec<&'static ClientCtx> {
-    let mut chain = Vec::new();
-    if has_cookies {
-        chain.push(&WEB_MUSIC);
-    }
-    chain.push(&ANDROID_VR);
-    chain.push(&IOS);
-    chain.push(&TV);
-    chain
+    PLAYER_CLIENTS
+        .iter()
+        .copied()
+        .filter(|ctx| has_cookies || !ctx.needs_cookies)
+        .collect()
 }
 
 /// YT Music search filter for songs (`params` is a percent-encoded protobuf).
@@ -166,7 +158,10 @@ pub(crate) fn cookie_header(cookies: &[Cookie]) -> Option<String> {
     if yt.is_empty() {
         return None;
     }
-    let pairs: Vec<String> = yt.iter().map(|c| format!("{}={}", c.name, c.value)).collect();
+    let pairs: Vec<String> = yt
+        .iter()
+        .map(|c| format!("{}={}", c.name, c.value))
+        .collect();
     Some(pairs.join("; "))
 }
 
@@ -185,7 +180,8 @@ pub struct YtClient {
     http: reqwest::Client,
     cookie_header: Option<String>,
     /// Small TTL cache of resolved stream URLs (see resolver).
-    pub(crate) stream_cache: Arc<Mutex<std::collections::HashMap<String, (StreamUrl, std::time::Instant)>>>,
+    pub(crate) stream_cache:
+        Arc<Mutex<std::collections::HashMap<String, (StreamUrl, std::time::Instant)>>>,
 }
 
 impl std::fmt::Debug for YtClient {
@@ -242,7 +238,10 @@ impl YtClient {
         endpoint: &str,
         body: Value,
     ) -> Result<Value> {
-        let url = format!("https://{}/youtubei/v1/{}?prettyPrint=false", ctx.host, endpoint);
+        let url = format!(
+            "https://{}/youtubei/v1/{}?prettyPrint=false",
+            ctx.host, endpoint
+        );
         let mut req = self
             .http
             .post(&url)
@@ -274,7 +273,11 @@ impl YtClient {
             return Err(anyhow!("{} {endpoint} returned HTTP {status}", ctx.key));
         }
         serde_json::from_str(&text).with_context(|| {
-            format!("{} {endpoint}: body is not JSON ({} bytes)", ctx.key, text.len())
+            format!(
+                "{} {endpoint}: body is not JSON ({} bytes)",
+                ctx.key,
+                text.len()
+            )
         })
     }
 
@@ -286,11 +289,14 @@ impl YtClient {
             "hl": "en",
             "gl": "US",
         });
-        if let Some(device) = &ctx.device {
-            if let (Some(target), Some(src)) = (client.as_object_mut(), device.as_object()) {
-                for (k, v) in src {
-                    target.insert(k.clone(), v.clone());
-                }
+        if !ctx.device_json.is_empty()
+            && let (Some(target), Ok(Value::Object(src))) = (
+                client.as_object_mut(),
+                serde_json::from_str::<Value>(ctx.device_json),
+            )
+        {
+            for (k, v) in src {
+                target.insert(k, v);
             }
         }
         json!({ "client": client })
@@ -360,9 +366,17 @@ mod tests {
     fn parses_netscape_cookies() {
         let now = 1_700_000_000;
         let cookies = parse_netscape_cookies(SAMPLE_COOKIES, now);
-        assert_eq!(cookies.len(), 2, "httponly kept, non-youtube and expired dropped");
+        // Domain filtering is a cookie_header concern (see the next test);
+        // parsing keeps every live YouTube-family entry: the #HttpOnly_
+        // prefix is stripped, expired entries are dropped, comments skipped.
+        assert_eq!(
+            cookies.len(),
+            3,
+            "httponly kept, expired dropped; domain filtered later"
+        );
         assert_eq!(cookies[0].name, "SID");
         assert_eq!(cookies[1].name, "LOGIN_INFO");
+        assert_eq!(cookies[2].name, "OTHER");
     }
 
     #[test]

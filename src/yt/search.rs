@@ -95,10 +95,10 @@ fn best_thumb(value: &Value) -> Option<String> {
             for t in items {
                 let url = t.get("url").and_then(Value::as_str);
                 let w = t.get("width").and_then(Value::as_i64).unwrap_or(0);
-                if let Some(url) = url {
-                    if best.map(|(bw, _)| w > bw).unwrap_or(true) {
-                        best = Some((w, url));
-                    }
+                if let Some(url) = url
+                    && best.map(|(bw, _)| w > bw).unwrap_or(true)
+                {
+                    best = Some((w, url));
                 }
             }
         }
@@ -110,9 +110,11 @@ fn best_thumb(value: &Value) -> Option<String> {
 fn watch_video_id(node: &Value) -> Option<String> {
     let mut endpoints: Vec<&Value> = Vec::new();
     find_all(node, "watchEndpoint", &mut endpoints);
-    endpoints
-        .iter()
-        .find_map(|ep| ep.get("videoId").and_then(Value::as_str).map(str::to_string))
+    endpoints.iter().find_map(|ep| {
+        ep.get("videoId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 /// Parse one `musicResponsiveListItemRenderer` (YT Music search result).
@@ -129,7 +131,11 @@ fn parse_search_item(item: &Value) -> Option<Track> {
     }
 
     let mut columns: Vec<&Value> = Vec::new();
-    find_all(item, "musicResponsiveListItemFlexColumnRenderer", &mut columns);
+    find_all(
+        item,
+        "musicResponsiveListItemFlexColumnRenderer",
+        &mut columns,
+    );
 
     let title = columns
         .first()
@@ -175,10 +181,10 @@ pub(crate) fn parse_search_tracks(resp: &Value, limit: usize) -> Vec<Track> {
         if tracks.len() >= limit {
             break;
         }
-        if let Some(track) = parse_search_item(item) {
-            if seen.insert(track.video_id.clone()) {
-                tracks.push(track);
-            }
+        if let Some(track) = parse_search_item(item)
+            && seen.insert(track.video_id.clone())
+        {
+            tracks.push(track);
         }
     }
     tracks
@@ -227,10 +233,10 @@ pub(crate) fn parse_radio_tracks(resp: &Value, limit: usize) -> Vec<Track> {
         if tracks.len() >= limit {
             break;
         }
-        if let Some(track) = parse_radio_item(item) {
-            if seen.insert(track.video_id.clone()) {
-                tracks.push(track);
-            }
+        if let Some(track) = parse_radio_item(item)
+            && seen.insert(track.video_id.clone())
+        {
+            tracks.push(track);
         }
     }
     tracks
@@ -254,7 +260,13 @@ mod tests {
         assert_eq!(first.artist, "Daft Punk");
         assert_eq!(first.album.as_deref(), Some("Discovery"));
         assert_eq!(first.duration_secs, Some(227));
-        assert!(first.thumb_url.as_deref().unwrap_or("").starts_with("https://"));
+        assert!(
+            first
+                .thumb_url
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("https://")
+        );
     }
 
     #[test]
