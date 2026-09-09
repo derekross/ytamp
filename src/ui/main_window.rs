@@ -23,6 +23,7 @@ pub fn show(app: &mut YtampApp, ui: &mut egui::Ui) {
     }
     egui::CentralPanel::default().show(ui, |ui| match app.view {
         crate::app::View::Search => super::search::show(app, ui),
+        crate::app::View::Library => super::library::show(app, ui),
         crate::app::View::Settings => super::settings::show(app, ui),
     });
 }
@@ -100,43 +101,49 @@ fn topbar(app: &mut YtampApp, ui: &mut egui::Ui) {
     ui.horizontal_centered(|ui| {
         ui.label(RichText::new("⚡ ytamp").strong().size(18.0));
         ui.separator();
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut app.search.query)
-                .hint_text("Search YouTube Music…  (Ctrl+F)")
-                .desired_width((ui.available_width() - 235.0).max(140.0)),
-        );
-        app.search.id = Some(response.id);
-        if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter)) {
-            app.begin_search();
-            response.request_focus();
-        }
-        let searched = ui.button("🔍").clicked();
-        if app.search.searching {
-            ui.spinner();
-        }
-        ui.separator();
-        ui.selectable_value(&mut app.view, crate::app::View::Search, "Search");
-        if app.yt.has_cookies()
-            && ui
-                .button("♥ Liked")
-                .on_hover_text("Your liked songs")
+        // The buttons take their room from the right first; the search
+        // box gets whatever is left, so nothing is ever cut off.
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui
+                .button("⧉ Mini")
+                .on_hover_text("Winamp mini player (Ctrl+M)")
                 .clicked()
-        {
-            app.begin_liked();
-        }
-        ui.selectable_value(&mut app.view, crate::app::View::Settings, "Settings");
-        ui.toggle_value(&mut app.show_queue, "Queue");
-        if ui
-            .button("⧉ Mini")
-            .on_hover_text("Winamp mini player (Ctrl+M)")
-            .clicked()
-        {
-            app.toggle_mini();
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if searched {
-            app.begin_search();
-        }
+            {
+                app.toggle_mini();
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            ui.toggle_value(&mut app.show_queue, "Queue");
+            ui.selectable_value(&mut app.view, crate::app::View::Settings, "Settings");
+            if ui
+                .selectable_label(app.view == crate::app::View::Library, "Library")
+                .clicked()
+                && app.view != crate::app::View::Library
+            {
+                app.view = crate::app::View::Library;
+                if app.yt.has_cookies() && app.search.committed != "Liked songs" {
+                    app.begin_liked();
+                }
+            }
+            ui.selectable_value(&mut app.view, crate::app::View::Search, "Search");
+            ui.separator();
+            if app.search.searching {
+                ui.spinner();
+            }
+            let searched = ui.button("🔍").clicked();
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut app.search.query)
+                    .hint_text("Search YouTube Music…  (Ctrl+F)")
+                    .desired_width((ui.available_width() - 8.0).max(120.0)),
+            );
+            app.search.id = Some(response.id);
+            let entered = response.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            if entered {
+                response.request_focus();
+            }
+            if searched || entered {
+                app.begin_search();
+            }
+        });
     });
 }
 

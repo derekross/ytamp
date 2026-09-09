@@ -25,6 +25,16 @@ impl Track {
     }
 }
 
+/// A playlist in the signed-in account's library.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Playlist {
+    /// The `browse` id (`VLPL…`, or `VLLM` for liked songs).
+    pub browse_id: String,
+    pub title: String,
+    /// "Playlist • 42 songs", as YouTube Music captions it.
+    pub subtitle: String,
+}
+
 /// Commands from UI to the player engine.
 #[derive(Clone, Debug)]
 pub enum PlayerCommand {

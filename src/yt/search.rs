@@ -8,7 +8,7 @@
 
 use serde_json::Value;
 
-use crate::model::Track;
+use crate::model::{Playlist, Track};
 
 /// Walk the JSON tree in document order, collecting the value under every
 /// occurrence of `key`.
@@ -264,9 +264,87 @@ pub(crate) fn parse_radio_tracks(resp: &Value, limit: usize) -> Vec<Track> {
     tracks
 }
 
+/// The first `browseEndpoint.browseId` under `node`.
+fn browse_id(node: &Value) -> Option<String> {
+    let mut endpoints: Vec<&Value> = Vec::new();
+    find_all(node, "browseEndpoint", &mut endpoints);
+    endpoints.iter().find_map(|ep| {
+        ep.get("browseId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+/// Parse the library's playlists (`FEmusic_liked_playlists`): the grid's
+/// `musicTwoRowItemRenderer` cards, or list rows, whose browse id is a
+/// playlist (`VL…`). The "New playlist" card has none and is skipped.
+pub(crate) fn parse_playlists(resp: &Value) -> Vec<Playlist> {
+    let mut items: Vec<&Value> = Vec::new();
+    find_all(resp, "musicTwoRowItemRenderer", &mut items);
+    find_all(resp, "musicResponsiveListItemRenderer", &mut items);
+    let mut seen = std::collections::HashSet::new();
+    let mut playlists = Vec::new();
+    for item in items {
+        let Some(id) = browse_id(item).filter(|id| id.starts_with("VL")) else {
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            continue;
+        }
+        let title = runs_text(item.get("title").unwrap_or(&Value::Null));
+        let title = if title.is_empty() {
+            // List rows keep the name in the first flex column.
+            let mut columns: Vec<&Value> = Vec::new();
+            find_all(
+                item,
+                "musicResponsiveListItemFlexColumnRenderer",
+                &mut columns,
+            );
+            columns
+                .first()
+                .map(|c| runs_text(c.get("text").unwrap_or(&Value::Null)))
+                .unwrap_or_default()
+        } else {
+            title
+        };
+        if title.is_empty() {
+            continue;
+        }
+        let subtitle = runs_text(item.get("subtitle").unwrap_or(&Value::Null));
+        playlists.push(Playlist {
+            browse_id: id,
+            title,
+            subtitle,
+        });
+    }
+    playlists
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_playlist_cards_parse_and_the_new_playlist_card_is_skipped() {
+        let resp = serde_json::json!({ "items": [
+            { "musicTwoRowItemRenderer": {
+                "title": { "runs": [ { "text": "New playlist" } ] },
+                "navigationEndpoint": { "createPlaylistEndpoint": {} } } },
+            { "musicTwoRowItemRenderer": {
+                "title": { "runs": [ { "text": "Liked Music" } ] },
+                "subtitle": { "runs": [ { "text": "Auto playlist" } ] },
+                "navigationEndpoint": { "browseEndpoint": { "browseId": "VLLM" } } } },
+            { "musicTwoRowItemRenderer": {
+                "title": { "runs": [ { "text": "Late nights" } ] },
+                "subtitle": { "runs": [ { "text": "Playlist" }, { "text": " • " }, { "text": "42 songs" } ] },
+                "navigationEndpoint": { "browseEndpoint": { "browseId": "VLPLabc" } } } }
+        ] });
+        let playlists = parse_playlists(&resp);
+        assert_eq!(playlists.len(), 2);
+        assert_eq!(playlists[0].browse_id, "VLLM");
+        assert_eq!(playlists[1].title, "Late nights");
+        assert_eq!(playlists[1].subtitle, "Playlist • 42 songs");
+    }
 
     const SEARCH_FIXTURE: &str = include_str!("fixtures/search_daft_punk.json");
     const RADIO_FIXTURE: &str = include_str!("fixtures/next_radio.json");

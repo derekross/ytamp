@@ -14,7 +14,14 @@ pub fn show(app: &mut YtampApp, ui: &mut egui::Ui) {
         landing(app, ui);
         return;
     }
+    results(app, ui);
+}
 
+/// The results panel: the committed title, then the tracks. The Library
+/// view lists through it too.
+pub fn results(app: &mut YtampApp, ui: &mut egui::Ui) {
+    let committed = app.search.committed.clone();
+    let searching = app.search.searching;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.heading(RichText::new(format!("“{committed}”")).strong());

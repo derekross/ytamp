@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{broadcast, mpsc};
 
-use crate::model::{PlaybackState, PlayerCommand, PlayerEvent, SpectrumFrame, Track};
+use crate::model::{PlaybackState, PlayerCommand, PlayerEvent, Playlist, SpectrumFrame, Track};
 use crate::settings::{EqSettings, Settings};
 
 // Real implementations (Builders A and B), per the frozen contracts.
@@ -332,7 +332,29 @@ pub enum SearchOutcome {
         video_id: String,
         tracks: Vec<Track>,
     },
+    /// The library's playlists arrived.
+    Playlists(Vec<Playlist>),
     Failed(String),
+}
+
+/// Which part of the library the Library view shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LibraryTab {
+    #[default]
+    Liked,
+    Songs,
+    Playlists,
+}
+
+/// The Library view's state; the tracks themselves list through
+/// `SearchState`, whose results panel every list shares.
+#[derive(Default)]
+pub struct LibraryState {
+    pub tab: LibraryTab,
+    pub playlists: Vec<Playlist>,
+    pub loading_playlists: bool,
+    /// The playlist whose tracks are listed, by browse id.
+    pub open_playlist: Option<String>,
 }
 
 /// Search box state + the results the central panel lists.
@@ -382,6 +404,7 @@ impl MiniPos {
 pub enum View {
     #[default]
     Search,
+    Library,
     Settings,
 }
 
@@ -425,6 +448,7 @@ pub struct YtampApp {
     /// The YT client behind an `Arc` so spawned tasks can take a copy.
     pub yt: Arc<YtClient>,
     pub search: SearchState,
+    pub library: LibraryState,
     search_outcome_tx: std::sync::mpsc::Sender<SearchOutcome>,
     search_rx: std::sync::mpsc::Receiver<SearchOutcome>,
 
@@ -546,6 +570,7 @@ impl YtampApp {
             rt,
             yt,
             search: SearchState::default(),
+            library: LibraryState::default(),
             search_outcome_tx,
             search_rx,
             skin_request_tx,
@@ -899,6 +924,10 @@ impl YtampApp {
     /// Forgets the account: the jar written by the sign-in window is
     /// deleted; a jar the user pointed at by hand is only unlinked.
     pub fn sign_out(&mut self) {
+        self.library = LibraryState::default();
+        if self.view == View::Library {
+            self.view = View::Search;
+        }
         if let Some(path) = self.settings.cookie_path.clone()
             && Path::new(&path) == crate::settings::default_cookie_path()
         {
@@ -933,25 +962,78 @@ impl YtampApp {
         });
     }
 
-    /// Shows the signed-in account's liked songs in the results list.
-    pub fn begin_liked(&mut self) {
-        let title = "Liked songs".to_string();
+    /// Lists `title` from a library fetch in the shared results panel.
+    fn begin_list<F>(&mut self, title: &str, view: View, fetch: F)
+    where
+        F: FnOnce(
+            Arc<YtClient>,
+        ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Vec<Track>>>,
+    {
+        let title = title.to_string();
         self.search.committed = title.clone();
         self.search.searching = true;
+        self.search.results.clear();
         self.search.selected = None;
         self.search.scroll_to = None;
-        self.view = View::Search;
+        self.view = view;
+        let tx = self.search_outcome_tx.clone();
+        let future = fetch(Arc::clone(&self.yt));
+        self.rt.spawn(async move {
+            let outcome = match future.await {
+                Ok(tracks) => SearchOutcome::Results {
+                    query: title.clone(),
+                    tracks,
+                },
+                Err(error) => SearchOutcome::Failed(format!("{title}: {error:#}")),
+            };
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// Library › Liked songs.
+    pub fn begin_liked(&mut self) {
+        self.library.tab = LibraryTab::Liked;
+        self.library.open_playlist = None;
+        self.begin_list("Liked songs", View::Library, |yt| {
+            Box::pin(async move { yt.liked_songs(100).await })
+        });
+    }
+
+    /// Library › Songs (added to the library).
+    pub fn begin_library_songs(&mut self) {
+        self.library.tab = LibraryTab::Songs;
+        self.library.open_playlist = None;
+        self.begin_list("Library songs", View::Library, |yt| {
+            Box::pin(async move { yt.library_songs(100).await })
+        });
+    }
+
+    /// Library › Playlists: fetches the list; a click opens one.
+    pub fn begin_playlists(&mut self) {
+        self.library.tab = LibraryTab::Playlists;
+        self.view = View::Library;
+        if self.library.loading_playlists {
+            return;
+        }
+        self.library.loading_playlists = true;
         let yt = Arc::clone(&self.yt);
         let tx = self.search_outcome_tx.clone();
         self.rt.spawn(async move {
-            let outcome = match yt.liked_songs(200).await {
-                Ok(tracks) => SearchOutcome::Results {
-                    query: title,
-                    tracks,
-                },
-                Err(error) => SearchOutcome::Failed(format!("liked songs: {error:#}")),
+            let outcome = match yt.library_playlists().await {
+                Ok(playlists) => SearchOutcome::Playlists(playlists),
+                Err(error) => SearchOutcome::Failed(format!("playlists: {error:#}")),
             };
             let _ = tx.send(outcome);
+        });
+    }
+
+    /// Lists one playlist's tracks.
+    pub fn open_playlist(&mut self, playlist: &Playlist) {
+        self.library.tab = LibraryTab::Playlists;
+        self.library.open_playlist = Some(playlist.browse_id.clone());
+        let id = playlist.browse_id.clone();
+        self.begin_list(&playlist.title, View::Library, move |yt| {
+            Box::pin(async move { yt.playlist_tracks(&id, 100).await })
         });
     }
 
@@ -1015,8 +1097,16 @@ impl YtampApp {
                     self.toast(format!("Radio: +{added} tracks"));
                 }
             }
+            SearchOutcome::Playlists(playlists) => {
+                self.library.loading_playlists = false;
+                if playlists.is_empty() {
+                    self.toast("No playlists in the library");
+                }
+                self.library.playlists = playlists;
+            }
             SearchOutcome::Failed(error) => {
                 self.search.searching = false;
+                self.library.loading_playlists = false;
                 self.toast_error(error);
             }
         }
@@ -1234,6 +1324,21 @@ impl YtampApp {
             ctx.request_repaint_after(Duration::from_millis(50));
         }
         let wanted = crate::ui::winamp::window_size(&self.mini.winamp);
+        // The size hints follow the playlist's range as soon as it
+        // changes, whether or not the window's size is right: a window
+        // whose min and max are equal is one the compositor refuses to
+        // let the grip resize.
+        let hinted = egui::Id::new("ytamp-mini-hints");
+        let last_hint: Option<(f32, f32, f32)> = ctx.data(|data| data.get_temp(hinted));
+        if last_hint != Some((wanted.x, heights.0, heights.1)) {
+            ctx.data_mut(|data| data.insert_temp(hinted, (wanted.x, heights.0, heights.1)));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(egui::vec2(
+                wanted.x, heights.0,
+            )));
+            ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(egui::vec2(
+                wanted.x, heights.1,
+            )));
+        }
         if self.mini.winamp.resize_grab.is_none() && fit_mini_window(&ctx, wanted, heights) {
             // Reopen at the right size: the shell's loop makes a new mini
             // window when the intent is set while the mode stays mini.

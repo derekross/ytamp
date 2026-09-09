@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result, anyhow};
 use serde_json::{Value, json};
 
-use crate::model::Track;
+use crate::model::{Playlist, Track};
 use crate::yt::resolver::StreamUrl;
 use crate::yt::search;
 
@@ -496,27 +496,41 @@ impl YtClient {
         Ok(tracks)
     }
 
-    /// The signed-in account's liked songs (YouTube Music's "Liked music"
-    /// playlist), first page. Needs cookies.
-    pub async fn liked_songs(&self, limit: usize) -> Result<Vec<Track>> {
+    /// One signed-in `browse` call on the YT Music client.
+    async fn browse(&self, browse_id: &str) -> Result<Value> {
         if !self.has_cookies() {
-            return Err(anyhow!("sign in to see your liked songs"));
+            return Err(anyhow!("sign in to see your library"));
         }
         let body = json!({
             "context": Self::context_for(&WEB_MUSIC, self.cached_visitor().as_deref()),
-            "browseId": "FEmusic_liked_videos",
+            "browseId": browse_id,
         });
-        let resp = self
-            .call_api(&WEB_MUSIC, "browse", body)
+        self.call_api(&WEB_MUSIC, "browse", body)
             .await
-            .context("YT Music library (browse) failed")?;
-        let tracks = search::parse_search_tracks(&resp, limit);
-        if tracks.is_empty() {
-            return Err(anyhow!(
-                "no liked songs came back — the account may have none, or the sign-in is stale"
-            ));
-        }
-        Ok(tracks)
+            .with_context(|| format!("YT Music browse {browse_id} failed"))
+    }
+
+    /// The tracks of a playlist by browse id (`VLPL…`; `VLLM` is liked
+    /// songs). First page: up to 100 tracks.
+    pub async fn playlist_tracks(&self, browse_id: &str, limit: usize) -> Result<Vec<Track>> {
+        let resp = self.browse(browse_id).await?;
+        Ok(search::parse_search_tracks(&resp, limit))
+    }
+
+    /// The account's liked songs: YouTube Music's "Liked Music" playlist.
+    pub async fn liked_songs(&self, limit: usize) -> Result<Vec<Track>> {
+        self.playlist_tracks("VLLM", limit).await
+    }
+
+    /// Library › Songs: what the account added to its library.
+    pub async fn library_songs(&self, limit: usize) -> Result<Vec<Track>> {
+        self.playlist_tracks("FEmusic_liked_videos", limit).await
+    }
+
+    /// Library › Playlists: the account's own and saved playlists.
+    pub async fn library_playlists(&self) -> Result<Vec<Playlist>> {
+        let resp = self.browse("FEmusic_liked_playlists").await?;
+        Ok(search::parse_playlists(&resp))
     }
 
     /// Raw `player` response for one client. Public within the crate for the
