@@ -8,6 +8,8 @@ pub mod eq;
 #[cfg(feature = "login-webview")]
 pub mod login;
 pub mod model;
+#[cfg(target_os = "linux")]
+pub mod mpris;
 pub mod player;
 pub mod settings;
 pub mod skin;

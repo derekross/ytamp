@@ -465,6 +465,13 @@ pub struct YtampApp {
     downloads: Option<DownloadsWatch>,
     /// The sign-in window's process while it is open.
     login: Option<std::process::Child>,
+    /// Desktop media controls (MPRIS), started with the first window.
+    #[cfg(target_os = "linux")]
+    media: Option<crate::mpris::MediaService>,
+    /// The window's context, for the media service to wake it.
+    wake_ctx: Arc<std::sync::Mutex<Option<egui::Context>>>,
+    /// The position the desktop was last told, to notice seeks.
+    media_position_secs: f64,
 
     pub mini: MiniState,
     pub toasts: Vec<Toast>,
@@ -580,6 +587,10 @@ impl YtampApp {
             skin_url: String::new(),
             downloads: None,
             login: None,
+            #[cfg(target_os = "linux")]
+            media: None,
+            wake_ctx: Arc::new(std::sync::Mutex::new(None)),
+            media_position_secs: 0.0,
             toasts: Vec::new(),
             switch_intent: false,
             view: View::default(),
@@ -617,6 +628,20 @@ impl YtampApp {
         // uploaded again on their first frame.
         self.mini.textures.clear();
         self.mini.winamp.playlist_text.clear();
+        if let Ok(mut slot) = self.wake_ctx.lock() {
+            *slot = Some(ctx.clone());
+        }
+        #[cfg(target_os = "linux")]
+        if self.media.is_none() {
+            let wake = Arc::clone(&self.wake_ctx);
+            self.media = Some(crate::mpris::MediaService::spawn(move || {
+                if let Ok(slot) = wake.lock()
+                    && let Some(ctx) = slot.as_ref()
+                {
+                    ctx.request_repaint();
+                }
+            }));
+        }
         install_theme(ctx);
         install_fonts(ctx);
         egui_extras::install_image_loaders(ctx);
@@ -641,6 +666,7 @@ impl YtampApp {
         self.drain_echoes();
         self.poll_downloads();
         self.poll_login();
+        self.serve_media_controls(ctx);
         self.tick_toasts();
         self.save_if_due();
         if self
@@ -859,6 +885,78 @@ impl YtampApp {
             (None, ..) => "Signed out".to_string(),
         };
         self.toast(message);
+    }
+
+    // ---- desktop media controls ------------------------------------------
+
+    /// Answers media keys and the shell's player widget, and tells them
+    /// what is playing.
+    #[cfg(target_os = "linux")]
+    fn serve_media_controls(&mut self, ctx: &egui::Context) {
+        let commands = self
+            .media
+            .as_ref()
+            .map(crate::mpris::MediaService::drain_commands)
+            .unwrap_or_default();
+        for command in commands {
+            self.apply_media_command(command, ctx);
+        }
+        // A jump of more than a second is a seek, not playback.
+        let position = self.state.position_secs;
+        if (position - self.media_position_secs).abs() > 1.5
+            && let Some(media) = &self.media
+        {
+            media.seeked((position.max(0.0) * 1000.0) as u64);
+        }
+        self.media_position_secs = position;
+        let state = crate::mpris::MediaState::of(&self.state);
+        if let Some(media) = self.media.as_mut() {
+            media.update(state);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn serve_media_controls(&mut self, _ctx: &egui::Context) {}
+
+    #[cfg(target_os = "linux")]
+    fn apply_media_command(&mut self, command: crate::mpris::MediaCommand, ctx: &egui::Context) {
+        use crate::mpris::MediaCommand;
+        let duration = self.state.duration_secs.unwrap_or(0.0);
+        let seek_to = |secs: f64| -> Option<PlayerCommand> {
+            (duration > 0.0).then(|| PlayerCommand::SeekRatio((secs / duration).clamp(0.0, 1.0)))
+        };
+        match command {
+            MediaCommand::Play => {
+                if !self.state.playing {
+                    self.send_cmd(PlayerCommand::Resume);
+                }
+            }
+            MediaCommand::Pause => self.send_cmd(PlayerCommand::Pause),
+            MediaCommand::PlayPause => self.send_cmd(PlayerCommand::PlayPause),
+            MediaCommand::Stop => self.send_cmd(PlayerCommand::Stop),
+            MediaCommand::Next => self.send_cmd(PlayerCommand::Next),
+            MediaCommand::Previous => self.send_cmd(PlayerCommand::Prev),
+            MediaCommand::SeekBy(offset_ms) => {
+                let target = self.state.position_secs + offset_ms as f64 / 1000.0;
+                if let Some(command) = seek_to(target) {
+                    self.send_cmd(command);
+                }
+            }
+            MediaCommand::SetPosition(position_ms) => {
+                if let Some(command) = seek_to(position_ms as f64 / 1000.0) {
+                    self.send_cmd(command);
+                }
+            }
+            MediaCommand::SetVolume(volume) => self.set_volume(volume.clamp(0.0, 1.0) as f32),
+            MediaCommand::Raise => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            MediaCommand::Quit => {
+                self.switch_intent = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
     }
 
     // ---- sign-in --------------------------------------------------------
