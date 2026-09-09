@@ -1,9 +1,9 @@
 //! InnerTube transport: client contexts, cookie handling, and the search /
 //! next / player endpoints.
 //!
-//! Client constants extracted from yt-dlp 2026.07.04
+//! Client constants extracted from yt-dlp 2026.08.19
 //! (`yt_dlp/extractor/youtube/_base.py`, `INNERTUBE_CLIENTS`) — the freshest
-//! maintained source as of 2026-09-08. Refresh these when yt-dlp bumps them.
+//! maintained source as of 2026-09-09. Refresh these when yt-dlp bumps them.
 
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,13 +40,26 @@ pub(crate) struct ClientCtx {
     pub needs_cookies: bool,
 }
 
+/// The plain web client: only used to mint a visitor id.
+const WEB: ClientCtx = ClientCtx {
+    key: "web",
+    host: "www.youtube.com",
+    name: "WEB",
+    version: "2.20260707.00.00",
+    id: 1,
+    ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    device_json: "",
+    music: false,
+    needs_cookies: false,
+};
+
 /// YT Music web client. Fresh search/next metadata; with cookies also the
 /// Premium lane (itag 141 AAC 256k, no PO token per the research doc).
 const WEB_MUSIC: ClientCtx = ClientCtx {
     key: "web_music",
     host: "music.youtube.com",
     name: "WEB_REMIX",
-    version: "1.20260114.03.00",
+    version: "1.20260707.12.00",
     id: 67,
     ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36,gzip(gfe)",
     device_json: "",
@@ -54,7 +67,24 @@ const WEB_MUSIC: ClientCtx = ClientCtx {
     needs_cookies: true,
 };
 
-/// Anonymous player client with no PO-token requirement today.
+/// Anonymous player client with no PO-token policy in yt-dlp 2026.08.19:
+/// its URLs serve the whole file without a token (the others are cut off
+/// after the first megabyte). First in the anonymous chain.
+const VISIONOS: ClientCtx = ClientCtx {
+    key: "visionos",
+    host: "www.youtube.com",
+    name: "VISIONOS",
+    version: "1.02",
+    id: 101,
+    ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+    device_json: r#"{"deviceMake":"Apple","deviceModel":"RealityDevice17,1","osName":"visionOS","osVersion":"26.5.23O471"}"#,
+    music: false,
+    needs_cookies: false,
+};
+
+/// Anonymous player client. yt-dlp 2026.08.19 marks its streams as
+/// needing a GVS PO token; kept in the chain for the networks where it
+/// still answers.
 const ANDROID_VR: ClientCtx = ClientCtx {
     key: "android_vr",
     host: "www.youtube.com",
@@ -73,9 +103,9 @@ const IOS: ClientCtx = ClientCtx {
     key: "ios",
     host: "www.youtube.com",
     name: "IOS",
-    version: "21.02.3",
+    version: "21.26.4",
     id: 5,
-    ua: "com.google.ios.youtube/21.02.3 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+    ua: "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
     device_json: r#"{"deviceMake":"Apple","deviceModel":"iPhone16,2","osName":"iPhone","osVersion":"18.3.2.22D82"}"#,
     music: false,
     needs_cookies: false,
@@ -86,7 +116,7 @@ const TV: ClientCtx = ClientCtx {
     key: "tv",
     host: "www.youtube.com",
     name: "TVHTML5",
-    version: "7.20260114.12.00",
+    version: "7.20260707.07.00",
     id: 7,
     ua: "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)",
     device_json: "",
@@ -96,7 +126,7 @@ const TV: ClientCtx = ClientCtx {
 
 /// Player-request clients in chain order (DESIGN.md): cookies unlock
 /// `web_music` first, then anonymous mobile/TV clients.
-const PLAYER_CLIENTS: [&ClientCtx; 4] = [&WEB_MUSIC, &ANDROID_VR, &IOS, &TV];
+const PLAYER_CLIENTS: [&ClientCtx; 5] = [&WEB_MUSIC, &VISIONOS, &ANDROID_VR, &IOS, &TV];
 
 /// The chain for a session: every client when cookies are present, only the
 /// anonymous-capable ones otherwise (`needs_cookies` marks the difference).
@@ -182,7 +212,14 @@ pub struct YtClient {
     /// Small TTL cache of resolved stream URLs (see resolver).
     pub(crate) stream_cache:
         Arc<Mutex<std::collections::HashMap<String, (StreamUrl, std::time::Instant)>>>,
+    /// The session's visitor id (`visitorData`), fetched once and kept for
+    /// [`VISITOR_TTL`]. Player requests without it are answered with the
+    /// "confirm you're not a bot" wall on ordinary home connections too.
+    visitor: Arc<Mutex<Option<(String, std::time::Instant)>>>,
 }
+
+/// How long a visitor id is reused before a fresh one is fetched.
+const VISITOR_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 impl std::fmt::Debug for YtClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -208,6 +245,7 @@ impl YtClient {
             http: Self::build_http(header.is_some()),
             cookie_header: header,
             stream_cache: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            visitor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -231,6 +269,42 @@ impl YtClient {
         builder.build().unwrap_or_default()
     }
 
+    /// The cached visitor id, if it is still fresh.
+    fn cached_visitor(&self) -> Option<String> {
+        let visitor = self.visitor.lock().ok()?;
+        visitor
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < VISITOR_TTL)
+            .map(|(id, _)| id.clone())
+    }
+
+    /// A visitor id for this session, fetched from the InnerTube
+    /// `visitor_id` endpoint (yt-dlp reads the same value out of the watch
+    /// page's `ytcfg`). Failures are logged and leave requests without one.
+    pub(crate) async fn visitor_data(&self) -> Option<String> {
+        if let Some(id) = self.cached_visitor() {
+            return Some(id);
+        }
+        let body = json!({ "context": Self::context_for(&WEB, None) });
+        let id = match self.call_api(&WEB, "visitor_id", body).await {
+            Ok(resp) => resp
+                .get("responseContext")
+                .and_then(|r| r.get("visitorData"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            Err(e) => {
+                log::warn!("visitor id: {e:#}");
+                None
+            }
+        };
+        if let Some(id) = &id
+            && let Ok(mut visitor) = self.visitor.lock()
+        {
+            *visitor = Some((id.clone(), std::time::Instant::now()));
+        }
+        id
+    }
+
     /// POST one InnerTube request and return the parsed JSON.
     pub(crate) async fn call_api(
         &self,
@@ -248,13 +322,15 @@ impl YtClient {
             .header("Content-Type", "application/json")
             .header("X-YouTube-Client-Name", ctx.id.to_string())
             .header("X-YouTube-Client-Version", ctx.version)
+            .header("Origin", format!("https://{}", ctx.host))
             .header("Accept", "*/*");
         // Client-specific UA wins; cookies ride along on every YouTube host.
         req = req.header("User-Agent", ctx.ua);
+        if let Some(visitor) = self.cached_visitor() {
+            req = req.header("X-Goog-Visitor-Id", visitor);
+        }
         if ctx.music {
-            req = req
-                .header("Origin", "https://music.youtube.com")
-                .header("Referer", "https://music.youtube.com/");
+            req = req.header("Referer", "https://music.youtube.com/");
         }
         if let Some(cookies) = &self.cookie_header {
             req = req.header("Cookie", cookies);
@@ -281,14 +357,17 @@ impl YtClient {
         })
     }
 
-    /// `context` block for a client.
-    fn context_for(ctx: &ClientCtx) -> Value {
+    /// `context` block for a client, with the visitor id when there is one.
+    fn context_for(ctx: &ClientCtx, visitor: Option<&str>) -> Value {
         let mut client = json!({
             "clientName": ctx.name,
             "clientVersion": ctx.version,
             "hl": "en",
             "gl": "US",
         });
+        if let (Some(visitor), Some(target)) = (visitor, client.as_object_mut()) {
+            target.insert("visitorData".into(), Value::String(visitor.to_string()));
+        }
         if !ctx.device_json.is_empty()
             && let (Some(target), Ok(Value::Object(src))) = (
                 client.as_object_mut(),
@@ -305,7 +384,7 @@ impl YtClient {
     /// Search YT Music for tracks (songs filter).
     pub async fn search_tracks(&self, q: &str, limit: usize) -> Result<Vec<Track>> {
         let body = json!({
-            "context": Self::context_for(&WEB_MUSIC),
+            "context": Self::context_for(&WEB_MUSIC, self.cached_visitor().as_deref()),
             "query": q,
             "params": SEARCH_PARAMS_SONGS,
         });
@@ -323,7 +402,7 @@ impl YtClient {
     /// The YT Music radio/autoplay queue seeded by a video ("Watch Next" mix).
     pub async fn radio_for(&self, video_id: &str, limit: usize) -> Result<Vec<Track>> {
         let body = json!({
-            "context": Self::context_for(&WEB_MUSIC),
+            "context": Self::context_for(&WEB_MUSIC, self.cached_visitor().as_deref()),
             "videoId": video_id,
             "playlistId": format!("RDAMVM{video_id}"),
             "isAudioOnly": true,
@@ -342,8 +421,9 @@ impl YtClient {
     /// Raw `player` response for one client. Public within the crate for the
     /// resolver.
     pub(crate) async fn player(&self, ctx: &ClientCtx, video_id: &str) -> Result<Value> {
+        let visitor = self.visitor_data().await;
         let body = json!({
-            "context": Self::context_for(ctx),
+            "context": Self::context_for(ctx, visitor.as_deref()),
             "videoId": video_id,
             "contentCheckOk": true,
             "racyCheckOk": true,
@@ -398,10 +478,10 @@ mod tests {
         let anon = client_chain(false);
         assert_eq!(
             anon.iter().map(|c| c.key).collect::<Vec<_>>(),
-            vec!["android_vr", "ios", "tv"]
+            vec!["visionos", "android_vr", "ios", "tv"]
         );
         let authed = client_chain(true);
         assert_eq!(authed[0].key, "web_music");
-        assert_eq!(authed.len(), 4);
+        assert_eq!(authed.len(), 5);
     }
 }

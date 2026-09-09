@@ -30,36 +30,12 @@ use crate::model::SpectrumFrame;
 /// Anything the decoder can read from: local files (tests), cursors over
 /// fixture bytes, or [`RangedHttpSource`] (YouTube).
 ///
-/// DESIGN.md says `Box<dyn Read + Send>`; isomp4 demuxing needs `Seek`, and
-/// symphonia's `MediaSource` wants `Sync` too, so this is the closest
-/// implementable contract. Local files and cursors satisfy it
-/// automatically via the blanket impl.
-pub trait MediaInput: Read + Seek + Send + Sync {}
-impl<T: Read + Seek + Send + Sync> MediaInput for T {}
-
-/// Adapts a [`MediaInput`] to symphonia's `MediaSource`.
-struct MediaInputStream(Box<dyn MediaInput>);
-
-impl Read for MediaInputStream {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.0.read(buf)
-    }
-}
-
-impl Seek for MediaInputStream {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.0.seek(pos)
-    }
-}
-
-impl MediaSource for MediaInputStream {
-    fn is_seekable(&self) -> bool {
-        true
-    }
-    fn byte_len(&self) -> Option<u64> {
-        None
-    }
-}
+/// DESIGN.md says `Box<dyn Read + Send>`; isomp4 demuxing needs `Seek` and,
+/// for a seekable source, the total length (`byte_len`), so the contract is
+/// symphonia's own `MediaSource`. Files and cursors implement it already;
+/// [`RangedHttpSource`] learns its length from the first `Content-Range`.
+pub trait MediaInput: MediaSource {}
+impl<T: MediaSource> MediaInput for T {}
 
 /// What the decode loop should do next.
 pub(crate) enum LoopCtl {
@@ -103,10 +79,7 @@ pub(crate) fn decode_stream(
     analyser: &mut Analyser,
     ctl: &mut dyn SessionCtl,
 ) -> Result<PacketStats> {
-    let mss = MediaSourceStream::new(
-        Box::new(MediaInputStream(input)),
-        MediaSourceStreamOptions::default(),
-    );
+    let mss = MediaSourceStream::new(input, MediaSourceStreamOptions::default());
     let hint = Hint::new();
     let probed = get_probe()
         .format(
@@ -276,9 +249,9 @@ pub(crate) fn decode_stream(
 /// seek — the "ranged-HTTP prefetch buffer" from DESIGN.md, in its v0.1
 /// shape: sequential chunks, no speculative parallel ranges.
 ///
-/// All async work (reqwest) runs through `handle.block_on`; this type is
-/// only ever used from the engine's dedicated decode thread, never from
-/// an async context.
+/// Reads block on reqwest through `handle.block_on`; this type is only
+/// ever used from the engine's dedicated decode thread, never from an
+/// async task.
 pub struct RangedHttpSource {
     client: reqwest::Client,
     handle: tokio::runtime::Handle,
@@ -296,51 +269,33 @@ pub struct RangedHttpSource {
 const CHUNK: u64 = 512 * 1024;
 
 impl RangedHttpSource {
-    pub fn new(url: String, client: reqwest::Client, handle: tokio::runtime::Handle) -> Self {
-        Self {
+    /// Opens the resource: fetches its first slice now, so the total length
+    /// is known before the demuxer probes (isomp4 refuses a seekable source
+    /// of unknown length) and `SeekFrom::End` works from the start.
+    pub async fn open(
+        url: String,
+        client: reqwest::Client,
+        handle: tokio::runtime::Handle,
+    ) -> io::Result<Self> {
+        let (status, len, body) = fetch_range(&client, &url, 0).await?;
+        let len = len.or_else(|| (status == reqwest::StatusCode::OK).then_some(body.len() as u64));
+        Ok(Self {
             client,
             handle,
             url,
             pos: 0,
-            buf: Vec::new(),
+            buf: body,
             buf_start: 0,
-            len: None,
-        }
+            len,
+        })
     }
 
     /// Fetch the next slice starting at `self.pos`.
     fn fill(&mut self) -> io::Result<usize> {
         let start = self.pos;
-        let end = start + CHUNK - 1;
-        let range = format!("bytes={start}-{end}");
-
-        let (status, content_range, body) = self.handle.block_on(async {
-            let resp = self
-                .client
-                .get(&self.url)
-                .header(reqwest::header::RANGE, &range)
-                .timeout(Duration::from_secs(30))
-                .send()
-                .await
-                .map_err(|e| io::Error::other(format!("stream fetch failed: {e}")))?;
-            let status = resp.status();
-            let content_range = resp
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
-            let body = resp
-                .bytes()
-                .await
-                .map_err(|e| io::Error::other(format!("stream body failed: {e}")))?;
-            Ok::<_, io::Error>((status, content_range, body))
-        })?;
-
-        if !status.is_success() {
-            return Err(io::Error::other(format!(
-                "stream fetch returned HTTP {status}"
-            )));
-        }
+        let (status, len, body) =
+            self.handle
+                .block_on(fetch_range(&self.client, &self.url, start))?;
         if status == reqwest::StatusCode::OK && start > 0 {
             // Server ignored the Range header and would silently desync us.
             return Err(io::Error::new(
@@ -348,14 +303,10 @@ impl RangedHttpSource {
                 "server ignored the Range request",
             ));
         }
-        if let Some(total) = content_range.as_deref().and_then(parse_content_range_total) {
+        if let Some(total) = len {
             self.len = Some(total);
-        } else if status == reqwest::StatusCode::OK {
-            // A plain 200 with no Content-Range: the body is the resource.
-            self.len = Some(body.len() as u64);
         }
-
-        self.buf = body.to_vec();
+        self.buf = body;
         self.buf_start = start;
         Ok(self.buf.len())
     }
@@ -371,13 +322,43 @@ impl RangedHttpSource {
     }
 }
 
+/// One ranged GET of `CHUNK` bytes from `start`: status, the total length
+/// from `Content-Range` when the server sent one, and the body.
+async fn fetch_range(
+    client: &reqwest::Client,
+    url: &str,
+    start: u64,
+) -> io::Result<(reqwest::StatusCode, Option<u64>, Vec<u8>)> {
+    let end = start + CHUNK - 1;
+    let resp = client
+        .get(url)
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| io::Error::other(format!("stream fetch failed: {e}")))?;
+    let status = resp.status();
+    log::debug!("range fetch {start}-{end}: HTTP {status}");
+    if !status.is_success() {
+        return Err(io::Error::other(format!(
+            "stream fetch returned HTTP {status}"
+        )));
+    }
+    let len = resp
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(parse_content_range_total);
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| io::Error::other(format!("stream body failed: {e}")))?;
+    Ok((status, len, body.to_vec()))
+}
+
 /// `Content-Range: bytes 0-524287/7300000` → `7300000`.
 fn parse_content_range_total(header: &str) -> Option<u64> {
-    let total = header.rsplit('/').next()?.trim();
-    total.parse::<u64>().ok().or(match total {
-        "*" => None,
-        _ => None,
-    })
+    header.rsplit('/').next()?.trim().parse::<u64>().ok()
 }
 
 impl Read for RangedHttpSource {
@@ -413,9 +394,9 @@ impl Seek for RangedHttpSource {
             SeekFrom::End(delta) => match self.len {
                 Some(len) => len as i64 + delta,
                 None => {
-                    // Unknown length: probe it with a 0-byte-range request?
-                    // v0.1: youtube streams always report Content-Range on
-                    // the first fill; treat missing length as unsupported.
+                    // `open` learned the length from the first fetch; a
+                    // server that sends no Content-Range cannot be seeked
+                    // from its end.
                     return Err(io::Error::new(
                         io::ErrorKind::Unsupported,
                         "cannot seek from end before the length is known",

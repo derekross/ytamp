@@ -240,11 +240,13 @@ fn youtube_fetcher(client: YtClient, handle: tokio::runtime::Handle) -> TrackFet
             let stream = crate::yt::resolve_stream(&client, &track.video_id)
                 .await
                 .with_context(|| format!("resolving a stream for {}", track.display()))?;
-            let source = crate::audio::decode::RangedHttpSource::new(
+            let source = crate::audio::decode::RangedHttpSource::open(
                 stream.url,
                 client.http().clone(),
                 handle,
-            );
+            )
+            .await
+            .with_context(|| format!("opening the stream for {}", track.display()))?;
             Ok((
                 Box::new(source) as Box<dyn MediaInput>,
                 stream.duration_secs,
