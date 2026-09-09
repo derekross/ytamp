@@ -151,8 +151,7 @@ mod device {
     /// if a track arrives with a different sample rate (rare: YouTube AAC
     /// is 44.1 kHz or 48 kHz).
     struct Device {
-        _stream: rodio::OutputStream,
-        handle: rodio::OutputStreamHandle,
+        stream: rodio::OutputStream,
         rate: u32,
     }
 
@@ -173,16 +172,16 @@ mod device {
 
     impl Iterator for LiveSource {
         type Item = f32;
-        fn next(&mut self) -> f32 {
-            match self.ring.lock() {
+        fn next(&mut self) -> Option<f32> {
+            Some(match self.ring.lock() {
                 Ok(mut queue) => queue.pop_front().unwrap_or(0.0),
                 Err(_) => 0.0,
-            }
+            })
         }
     }
 
     impl rodio::Source for LiveSource {
-        fn current_frame_len(&self) -> Option<usize> {
+        fn current_span_len(&self) -> Option<usize> {
             None
         }
         fn channels(&self) -> u16 {
@@ -213,19 +212,20 @@ mod device {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("audio device lock poisoned"))?;
             if guard.as_ref().is_none_or(|d| d.rate != spec.rate) {
-                let (stream, handle) = rodio::OutputStream::try_default()
+                let stream = rodio::OutputStreamBuilder::open_default_stream()
                     .context("opening the audio output stream (is a device present?)")?;
                 *guard = Some(Device {
-                    _stream: stream,
-                    handle,
+                    stream,
                     rate: spec.rate,
                 });
             }
-            let handle = guard.as_ref().expect("device just set").handle.clone();
+            let sink = {
+                let device = guard.as_ref().expect("device just set");
+                rodio::Sink::connect_new(device.stream.mixer())
+            };
             drop(guard);
 
             let ring = shared_ring(spec);
-            let sink = rodio::Sink::try_new(&handle).context("creating the playback sink")?;
             sink.append(LiveSource {
                 ring: ring.clone(),
                 spec,
