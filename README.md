@@ -36,7 +36,14 @@ Optional but recommended: `yt-dlp` on your `$PATH` — ytamp resolves streams na
 
 ## Skins
 
-Drag a `.wsz` file onto the mini player (Ctrl+M to open it), or drop skins in `~/.config/ytamp/skins/`. Classic skins only — same as fastpotify. Thousands live at the [Winamp Skin Museum](https://skins.webamp.org/).
+Thousands of classic skins live at the [Winamp Skin Museum](https://skins.webamp.org/). Any of these puts one on:
+
+- Click **Download** on a museum page: ytamp watches your Downloads folder and wears a new `.wsz` as it lands (Settings can turn this off).
+- Paste a museum page link, or any `.wsz` URL, with Ctrl+V over either window, or into the box in Settings.
+- Right-click the mini player's title bar (Ctrl+M opens it) to pick from your library, or drop skins in `~/.config/ytamp/skins/`.
+- Drag a `.wsz` file onto either window. On Wayland desktops the toolkit delivers no drops; tick "Run under X11" in Settings (or pass `--x11`) to get them through XWayland.
+
+Classic skins only — same as fastpotify.
 
 ## Attribution
 

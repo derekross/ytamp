@@ -83,13 +83,33 @@ fn skins(app: &mut YtampApp, ui: &mut egui::Ui) {
             "https://skins.webamp.org/",
         );
     });
+    ui.add_space(4.0);
+    let mut watch = app.settings.watch_downloads;
+    if ui
+        .checkbox(&mut watch, "Import new .wsz files from Downloads")
+        .on_hover_text("Click Download on the Skin Museum and the skin is worn a moment later.")
+        .changed()
+    {
+        app.settings.watch_downloads = watch;
+        app.mark_dirty();
+        app.sync_downloads_watch();
+    }
+    let mut x11 = app.settings.force_x11;
+    if ui
+        .checkbox(&mut x11, "Run under X11 for drag-and-drop (restart needed)")
+        .on_hover_text(
+            "Wayland gives this window no dropped files; XWayland does. \
+             Only files: a link dragged from the browser is not delivered either way.",
+        )
+        .changed()
+    {
+        app.settings.force_x11 = x11;
+        app.mark_dirty();
+    }
     ui.label(
-        RichText::new(format!(
-            "Skin library: {} — drop a .wsz anywhere to install.",
-            app.skins_dir.display()
-        ))
-        .weak()
-        .small(),
+        RichText::new(format!("Skin library: {}", app.skins_dir.display()))
+            .weak()
+            .small(),
     );
 }
 

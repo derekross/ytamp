@@ -30,6 +30,11 @@ struct Cli {
     /// Log filter, e.g. `debug,ytamp=trace` (default `warn,ytamp=info`).
     #[arg(long, value_name = "FILTER")]
     log_filter: Option<String>,
+
+    /// Open under X11 (XWayland on Wayland desktops), where dropped files
+    /// reach the window. Same as the setting, for one run.
+    #[arg(long)]
+    x11: bool,
 }
 
 /// The shared app slot; a poisoned lock is read through, never fatal.
@@ -74,6 +79,7 @@ fn main() -> eframe::Result<()> {
         settings.cookie_path = Some(cookies.display().to_string());
     }
 
+    let force_x11 = cli.x11 || settings.force_x11;
     let mut app =
         YtampApp::new(settings, settings_path, settings::skins_dir()).unwrap_or_else(|error| {
             eprintln!("ytamp: could not start: {error}");
@@ -91,7 +97,7 @@ fn main() -> eframe::Result<()> {
         let creator_slot = Arc::clone(&slot);
         let mini = lock(&slot).as_ref().and_then(MiniWindow::wanted);
         let mini_window = mini.is_some();
-        let options = native_options(mini);
+        let options = native_options(mini, force_x11);
         eframe::run_native(
             "ytamp",
             options,
@@ -120,7 +126,7 @@ fn main() -> eframe::Result<()> {
     Ok(())
 }
 
-fn native_options(mini: Option<MiniWindow>) -> eframe::NativeOptions {
+fn native_options(mini: Option<MiniWindow>, force_x11: bool) -> eframe::NativeOptions {
     // The mini player keeps its own geometry; its closing window must not
     // replace the main window's persisted size, and vice versa.
     let persist_window = mini.is_none();
@@ -150,10 +156,21 @@ fn native_options(mini: Option<MiniWindow>) -> eframe::NativeOptions {
             .with_inner_size([980.0, 640.0])
             .with_min_inner_size([720.0, 520.0]),
     };
+    // winit 0.30 delivers dropped files on X11 and not on Wayland; a
+    // Wayland desktop with XWayland can opt in.
+    let event_loop_builder: Option<eframe::EventLoopBuilderHook> = force_x11.then(|| {
+        Box::new(
+            |builder: &mut eframe::EventLoopBuilder<eframe::UserEvent>| {
+                use winit::platform::x11::EventLoopBuilderExtX11 as _;
+                builder.with_x11();
+            },
+        ) as eframe::EventLoopBuilderHook
+    });
     eframe::NativeOptions {
         viewport,
         persist_window,
         persistence_path,
+        event_loop_builder,
         // A Wayland compositor stops sending frame callbacks to a hidden
         // window; waiting for vsync there would block the event loop.
         // Repaints are event-driven, so nothing spins. (fastpotify's call.)

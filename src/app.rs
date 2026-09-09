@@ -154,10 +154,16 @@ fn safe_file_name(name: &str) -> String {
         .collect()
 }
 
+/// How long a compositor gets to honour a resize before the mini window
+/// is reopened at the wanted size instead.
+const RESIZE_PATIENCE: f64 = 1.5;
+
 /// Fits the fixed-size mini window to its wanted size. Compositors refuse
 /// chatty resize requests, so a rejected ask retries at most once a
-/// second (fastpotify's pattern).
-fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) {
+/// second (fastpotify's pattern). Returns true when the window has been
+/// the wrong size for longer than [`RESIZE_PATIENCE`]: a tiling or
+/// otherwise stubborn compositor, and the caller should reopen instead.
+fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) -> bool {
     let current = ctx.input(|input| {
         input
             .viewport()
@@ -165,19 +171,28 @@ fn fit_mini_window(ctx: &egui::Context, wanted: egui::Vec2) {
             .map(|rect| rect.size())
             .unwrap_or(wanted)
     });
-    if (current - wanted).abs().max_elem() < 1.0 {
-        return;
-    }
     let asked = egui::Id::new("ytamp-mini-fit");
+    let since = egui::Id::new("ytamp-mini-fit-since");
+    if (current - wanted).abs().max_elem() < 1.0 {
+        ctx.data_mut(|data| data.remove::<f64>(since));
+        return false;
+    }
     let now = ctx.input(|input| input.time);
+    let first: f64 = ctx.data_mut(|data| *data.get_temp_mut_or(since, now));
+    if now - first > RESIZE_PATIENCE {
+        log::debug!("the compositor kept the mini window at {current:?}, wanted {wanted:?}");
+        ctx.data_mut(|data| data.remove::<f64>(since));
+        return true;
+    }
     let last: Option<f64> = ctx.data(|data| data.get_temp(asked));
     if last.is_some_and(|last| now - last < 1.0) {
-        return;
+        return false;
     }
     ctx.data_mut(|data| data.insert_temp(asked, now));
     ctx.send_viewport_cmd(egui::ViewportCommand::MinInnerSize(wanted));
     ctx.send_viewport_cmd(egui::ViewportCommand::MaxInnerSize(wanted));
     ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(wanted));
+    false
 }
 
 /// Installs Inter as the proportional font when the system has it; egui's
@@ -217,6 +232,70 @@ pub fn install_fonts(ctx: &egui::Context) {
         return;
     }
     log::debug!("typography: Inter not found on this system; egui defaults");
+}
+
+/// Watches the Downloads folder for skins saved while the app runs, so
+/// the Skin Museum's Download button is all it takes.
+pub struct DownloadsWatch {
+    dir: PathBuf,
+    /// Files present at the last look, so only new ones are imported.
+    seen: std::collections::HashSet<PathBuf>,
+    last_look: Option<Instant>,
+}
+
+impl DownloadsWatch {
+    /// How often the folder is read.
+    const PERIOD: Duration = Duration::from_secs(3);
+    /// A file changed this recently may still be being written.
+    const SETTLE: Duration = Duration::from_secs(2);
+
+    /// Starts watching `dir`; whatever is there now is not imported.
+    pub fn new(dir: PathBuf) -> Self {
+        let mut watch = Self {
+            dir,
+            seen: std::collections::HashSet::new(),
+            last_look: None,
+        };
+        watch.seen = watch.skins_present().into_iter().map(|(p, _)| p).collect();
+        watch
+    }
+
+    fn skins_present(&self) -> Vec<(PathBuf, Option<std::time::SystemTime>)> {
+        std::fs::read_dir(&self.dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_skin_file(path) && path.is_file())
+            .map(|path| {
+                let modified = path.metadata().and_then(|m| m.modified()).ok();
+                (path, modified)
+            })
+            .collect()
+    }
+
+    /// New, settled skin files since the last look, at most once a period.
+    pub fn poll(&mut self) -> Vec<PathBuf> {
+        if self.last_look.is_some_and(|at| at.elapsed() < Self::PERIOD) {
+            return Vec::new();
+        }
+        self.last_look = Some(Instant::now());
+        let now = std::time::SystemTime::now();
+        let mut fresh = Vec::new();
+        for (path, modified) in self.skins_present() {
+            if self.seen.contains(&path) {
+                continue;
+            }
+            let settled = modified
+                .and_then(|m| now.duration_since(m).ok())
+                .is_some_and(|age| age >= Self::SETTLE);
+            if settled {
+                self.seen.insert(path.clone());
+                fresh.push(path);
+            }
+        }
+        fresh
+    }
 }
 
 /// A skin change asked for from somewhere that cannot touch the app
@@ -347,6 +426,8 @@ pub struct YtampApp {
     skin_list_at: Option<Instant>,
     /// The Settings page's "import from URL" box.
     pub skin_url: String,
+    /// The Downloads folder watch, while the setting is on.
+    downloads: Option<DownloadsWatch>,
 
     pub mini: MiniState,
     pub toasts: Vec<Toast>,
@@ -457,6 +538,7 @@ impl YtampApp {
             skin_list: Vec::new(),
             skin_list_at: None,
             skin_url: String::new(),
+            downloads: None,
             toasts: Vec::new(),
             switch_intent: false,
             view: View::default(),
@@ -477,6 +559,7 @@ impl YtampApp {
         if let Some(name) = app.settings.skin.clone() {
             app.load_skin_by_name(&name);
         }
+        app.sync_downloads_watch();
 
         // Bring the engine up to the persisted settings.
         let volume = app.settings.volume;
@@ -515,6 +598,7 @@ impl YtampApp {
         self.drain_search();
         self.drain_skin_requests();
         self.drain_echoes();
+        self.poll_downloads();
         self.tick_toasts();
         self.save_if_due();
         if self
@@ -538,6 +622,9 @@ impl YtampApp {
         }
         if !self.toasts.is_empty() {
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if self.downloads.is_some() {
+            ctx.request_repaint_after(DownloadsWatch::PERIOD);
         }
     }
 
@@ -581,6 +668,33 @@ impl YtampApp {
     }
 
     // ---- skins ----------------------------------------------------------
+
+    /// Starts or stops the Downloads watch to match the setting.
+    pub fn sync_downloads_watch(&mut self) {
+        match (self.settings.watch_downloads, self.downloads.is_some()) {
+            (true, false) => {
+                self.downloads = crate::settings::downloads_dir().map(DownloadsWatch::new);
+            }
+            (false, true) => self.downloads = None,
+            _ => {}
+        }
+    }
+
+    /// Imports skins that landed in Downloads since the last look.
+    fn poll_downloads(&mut self) {
+        let fresh = match self.downloads.as_mut() {
+            Some(watch) => watch.poll(),
+            None => return,
+        };
+        for path in fresh {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            self.toast(format!("Found {} in Downloads", skin_display_label(&name)));
+            self.install_skin(&path);
+        }
+    }
 
     /// Installs a skin file: copies it into the library, then loads it.
     pub fn install_skin(&mut self, path: &Path) {
@@ -973,7 +1087,14 @@ impl YtampApp {
         // kept in step before the draw.
         self.mini.winamp.eq_open = self.eq_open;
         let wanted = crate::ui::winamp::window_size(&self.mini.winamp);
-        fit_mini_window(&ctx, wanted);
+        if fit_mini_window(&ctx, wanted) {
+            // Reopen at the right size: the shell's loop makes a new mini
+            // window when the intent is set while the mode stays mini.
+            self.mini.pos.remember();
+            self.switch_intent = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
 
         // The skinless look is the engine's generated built-in skin.
         let builtin;
@@ -1001,12 +1122,10 @@ impl YtampApp {
         if self.eq_toggle_requested.swap(false, Ordering::Relaxed) {
             self.eq_open = !self.eq_open;
         }
-        if self
-            .playlist_toggle_requested
-            .swap(false, Ordering::Relaxed)
-        {
-            self.mini.winamp.playlist_open = !self.mini.winamp.playlist_open;
-        }
+        // The playlist's open flag lives in the skinned state, which the
+        // skin UI flips itself; the host call is only a notification.
+        self.playlist_toggle_requested
+            .store(false, Ordering::Relaxed);
         let scale = self.mini.winamp.scale.clamp(1, 4);
         if scale != u32::from(self.settings.skin_scale) {
             self.mini.winamp.scale = scale;
@@ -1188,7 +1307,7 @@ impl WinampHost for YtampApp {
     }
 
     fn toggle_playlist_window(&mut self) {
-        self.mini.winamp.playlist_open = !self.mini.winamp.playlist_open;
+        // `WinampState::playlist_open` is flipped by the skin UI itself.
     }
 
     fn leave_mini_player(&mut self) {
@@ -1386,6 +1505,36 @@ mod tests {
             .recv_timeout(Duration::from_secs(2))
             .unwrap();
         assert!(matches!(request, SkinRequest::Library(Some(name)) if name == "Zaxon.wsz"));
+    }
+
+    #[test]
+    fn the_downloads_watch_reports_only_new_settled_skins() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("old.wsz"), b"old").unwrap();
+        let mut watch = DownloadsWatch::new(dir.path().to_path_buf());
+        assert!(
+            watch.poll().is_empty(),
+            "what was already there is not imported"
+        );
+
+        let fresh = dir.path().join("new.wsz");
+        std::fs::write(&fresh, b"new").unwrap();
+        std::fs::write(dir.path().join("notes.txt"), b"x").unwrap();
+        // Just written: still settling, and the period has not passed.
+        watch.last_look = None;
+        assert!(watch.poll().is_empty());
+        // Backdate it and look again.
+        let old = std::time::SystemTime::now() - Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(&fresh)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        watch.last_look = None;
+        assert_eq!(watch.poll(), vec![fresh]);
+        watch.last_look = None;
+        assert!(watch.poll().is_empty(), "reported once");
     }
 
     #[test]

@@ -38,10 +38,16 @@ directories = "6"
 # not needed for a 2D music client. Same feature set fastpotify ships.
 eframe = { version = "0.36", default-features = false, features = ["accesskit", "glow", "default_fonts", "links", "wayland", "x11", "persistence"] }
 egui = "0.36"
-egui_extras = { version = "0.36", features = ["image"] }
+# `http` is the loader behind `Image::new("https://…")`: cover art.
+egui_extras = { version = "0.36", features = ["image", "http"] }
+# Only for `EventLoopBuilderExt::with_x11`: the opt-in X11 (XWayland) mode
+# that gives file drag-and-drop on Wayland desktops, where winit 0.30 has
+# no drop support. Same version eframe pins.
+winit = { version = "0.30", default-features = false, features = ["x11"] }
 
 # Winamp skins are BMP sprite sheets inside a zip (.wsz).
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp"] }
+# YouTube serves cover art as WebP or JPEG.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "bmp", "webp"] }
 flate2 = "1"
 # Filling glyph outlines with no anti-aliasing for the Winamp playlist text.
 tiny-skia = "0.11"

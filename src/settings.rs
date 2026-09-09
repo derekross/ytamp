@@ -46,6 +46,13 @@ pub struct Settings {
     pub cookie_path: Option<String>,
     /// Recent search terms, newest first.
     pub search_history: Vec<String>,
+    /// Import any `.wsz` that appears in the Downloads folder while the
+    /// app runs: the Skin Museum's Download button becomes the drop zone.
+    pub watch_downloads: bool,
+    /// Open the windows under X11 (XWayland on a Wayland desktop), where
+    /// winit delivers dropped files; Wayland gets none. Takes effect on
+    /// the next start.
+    pub force_x11: bool,
 }
 
 impl Default for Settings {
@@ -58,6 +65,8 @@ impl Default for Settings {
             winamp_window: false,
             cookie_path: None,
             search_history: Vec::new(),
+            watch_downloads: true,
+            force_x11: false,
         }
     }
 }
@@ -133,6 +142,14 @@ pub fn cache_dir() -> PathBuf {
     config_dir().join("cache")
 }
 
+/// The user's Downloads folder, where browsers put a Skin Museum download.
+pub fn downloads_dir() -> Option<PathBuf> {
+    directories::UserDirs::new()
+        .and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads")))
+        .filter(|dir| dir.is_dir())
+}
+
 /// Where a user-provided Netscape cookie jar lives by convention.
 pub fn default_cookie_path() -> PathBuf {
     config_dir().join("cookies.txt")
@@ -162,6 +179,8 @@ mod tests {
             winamp_window: true,
             cookie_path: Some("/tmp/cookies.txt".into()),
             search_history: vec!["lofi beats".into()],
+            watch_downloads: false,
+            force_x11: true,
         };
         let json = serde_json::to_string_pretty(&settings).unwrap();
         let restored: Settings = serde_json::from_str(&json).unwrap();
