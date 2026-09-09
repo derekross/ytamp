@@ -184,6 +184,10 @@ pub async fn resolve_stream(client: &YtClient, video_id: &str) -> Result<StreamU
     }
 
     // Escape hatch: hand the bleeding edge to yt-dlp.
+    log::warn!(
+        "no client resolved {video_id} natively ({}); trying yt-dlp",
+        attempts.join("; ")
+    );
     match yt_dlp_fallback(video_id).await {
         Ok(stream) => Ok(stream),
         Err(e) => Err(anyhow!(
